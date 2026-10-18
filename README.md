@@ -21,6 +21,9 @@ Plan payments are automatically verified against Binance Pay, BEP20, or TRC20 tr
 Set `RENTAL_SECRET` to comma-separated values during rotation; the first is
 used outbound and every configured value is accepted inbound. Set
 `ADS_ENTRY_URL` to the public service URL so the manifest links to `/`.
+IOAds runs independently when `RENTAL_HUB_URL` and `RENTAL_SECRET` are unset.
+Set both only when connecting it to the rental hub; standalone bot users and
+hub-provisioned tenants remain separate.
 
 Free-tier deliveries are copied by the control bot from the archive. Paid
 campaigns with inline mode enabled are sent when the connected userbot selects

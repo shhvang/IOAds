@@ -7,7 +7,7 @@ import { tierRank } from "./services/plans.js";
 import { setGroup } from "./services/groups.js";
 import { createCampaign, addTarget, setCampaignStatus } from "./services/campaigns.js";
 import { FakeTelegramAdapter } from "./telegram.js";
-import { setAdapterForTest, loginStart } from "./services/account.js";
+import { setAdapterForTest, loginStart, cancelLogin } from "./services/account.js";
 import { runSchedulerOnce } from "./services/scheduler.js";
 import { ownerAuth } from "./auth.js";
 import { createApiRouter } from "./api.js";
@@ -66,6 +66,11 @@ assert.deepEqual(adapter.inlineSent.at(-1), { chatId: "-100123", query: `campaig
 }
 await assert.rejects(() => loginStart(db, "tenant-a", "+fourth", "fourth"));
 assert.throws(() => createCampaign(db, "tenant-a", { name: "Foreign", message: "message", senderAccountId: "missing", intervalSeconds: 60 }));
+db.prepare("INSERT INTO accounts (accountId, tenantId, ownerId, status, createdAt, updatedAt) VALUES (?, ?, ?, 'connecting', ?, ?)").run("login-pending", "tenant-a", 42, new Date().toISOString(), new Date().toISOString());
+setAdapterForTest("tenant-a", "login-pending", new FakeTelegramAdapter());
+await cancelLogin(db, "tenant-a", "login-pending");
+assert.equal((db.prepare("SELECT status FROM accounts WHERE accountId = ?").get("login-pending") as { status: string }).status, "logged_out");
+assert.equal((db.prepare("SELECT loginPhone, phoneCodeHash FROM accounts WHERE accountId = ?").get("login-pending") as { loginPhone: string | null; phoneCodeHash: string | null }).phoneCodeHash, null);
 const initData = (token: string, userId: number): string => {
   const params = new URLSearchParams({ auth_date: String(Math.floor(Date.now() / 1000)), user: JSON.stringify({ id: userId }) });
   const check = [...params.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, value]) => `${key}=${value}`).join("\n");

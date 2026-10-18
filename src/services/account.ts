@@ -69,19 +69,34 @@ export async function loginStart(db: Database.Database, tenantId: string, phone:
   db.prepare(`INSERT INTO accounts (accountId, tenantId, ownerId, loginPhone, createdAt, updatedAt) SELECT ?, tenantId, ownerId, ?, ?, ? FROM tenants WHERE tenantId = ?
      ON CONFLICT(tenantId, accountId) DO UPDATE SET loginPhone=excluded.loginPhone, phoneCodeHash=NULL, status='connecting', updatedAt=excluded.updatedAt`).run(accountId, phone, created, created, tenantId);
   const adapter = adapterFor(db, tenantId, accountId);
-  const result = await adapter.sendCode(phone);
-  db.prepare("UPDATE accounts SET phoneCodeHash = ?, updatedAt = ? WHERE tenantId = ? AND accountId = ?").run(result.phoneCodeHash, now(), tenantId, accountId);
-  return { accountId, sent: true };
+  try {
+    const result = await adapter.sendCode(phone);
+    db.prepare("UPDATE accounts SET phoneCodeHash = ?, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(result.phoneCodeHash, now(), tenantId, accountId);
+    return { accountId, sent: true };
+  } catch (error) {
+    db.prepare("UPDATE accounts SET status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(now(), tenantId, accountId);
+    adapters.delete(key(tenantId, accountId));
+    await adapter.logout().catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function cancelLogin(db: Database.Database, tenantId: string, accountId: string): Promise<void> {
+  db.prepare("UPDATE accounts SET status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(now(), tenantId, accountId);
+  const adapter = adapters.get(key(tenantId, accountId));
+  adapters.delete(key(tenantId, accountId));
+  await adapter?.logout().catch(() => undefined);
 }
 
 export async function loginComplete(db: Database.Database, tenantId: string, accountId: string, phone: string, code: string, password?: string): Promise<void> {
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before login");
   const adapter = adapterFor(db, tenantId, accountId);
-  const row = db.prepare("SELECT phoneCodeHash FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { phoneCodeHash: string | null } | undefined;
-  if (!row?.phoneCodeHash) throw new Error("login code was not requested");
+  const row = db.prepare("SELECT phoneCodeHash, status FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { phoneCodeHash: string | null; status: string } | undefined;
+  if (row?.status !== "connecting" || !row.phoneCodeHash) throw new Error("login code was not requested");
   const result = await adapter.signIn(phone, row.phoneCodeHash, code, password);
-  db.prepare("UPDATE accounts SET phone = ?, telegramUserId = ?, session = ?, status = 'active', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ?")
+  const saved = db.prepare("UPDATE accounts SET phone = ?, telegramUserId = ?, session = ?, status = 'active', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'")
     .run(phone, result.userId, seal(result.session, config.sessionEncryptionKey), now(), tenantId, accountId);
+  if (!saved.changes) throw new Error("login was cancelled");
 }
 
 export async function logout(db: Database.Database, tenantId: string, accountId: string): Promise<void> {

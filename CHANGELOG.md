@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 - 2026-10-18
+
+### Improved
+- Refresh the bot dashboard with styled inline buttons and premium emoji.
+- Make userbot login progress, cancellation, and recovery clearer.
+
 ## 0.5.0 - 2026-10-16
 
 ### Added
