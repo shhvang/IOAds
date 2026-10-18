@@ -1,0 +1,31 @@
+{
+  "name": "ioads",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx src/ads.test.ts && tsx src/rental/contract.test.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "big-integer": "^1.6.52",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "grammy": "^1.46.0",
+    "telegram": "^2.26.22"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.1",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.3"
+  }
+}

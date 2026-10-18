@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IOAds</title>
+    <style>
+      :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #111827; color: #e5e7eb; }
+      body { max-width: 900px; margin: auto; padding: 24px; }
+      section { background: #1f2937; border: 1px solid #374151; border-radius: 12px; padding: 16px; margin: 16px 0; }
+      form { display: grid; gap: 10px; } input, textarea, button { border: 1px solid #4b5563; border-radius: 8px; padding: 10px; background: #111827; color: inherit; }
+      button { cursor: pointer; background: #2563eb; border-color: #2563eb; } .row { display: flex; gap: 8px; flex-wrap: wrap; } .row > * { flex: 1; min-width: 130px; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; } small { color: #9ca3af; }
+    </style>
+  </head>
+  <body>
+    <h1>IOAds</h1>
+    <p><small>Open this page from your Telegram control bot. Telegram initData is attached automatically and never displayed. Outside Telegram, an approved proxy can supply the optional fallback headers.</small></p>
+    <section><form id="auth"><div class="row"><input name="tenantId" placeholder="tenantId" required></div><button>Use tenant</button></form><pre id="status"></pre></section>
+      <section><h2>Accounts</h2><select id="accountSelect"><option value="">Select an account</option></select><button id="refreshAccounts">Refresh accounts</button><form id="login"><input name="phone" placeholder="Phone" required><button>Request code for new account</button></form><form id="code"><input name="phone" placeholder="Phone" required><input name="code" placeholder="Code" required><input name="password" placeholder="2FA password" type="password"><button>Complete selected login</button></form><button id="logout">Log out selected</button><button id="deleteAccount">Delete selected</button></section>
+     <section><h2>Groups</h2><button id="sync">Sync selected account groups</button><select id="groupSelect"><option value="">Select a synced group</option></select><pre id="groups"></pre><form id="group"><input name="chatId" placeholder="chatId" required><input name="messageOverride" placeholder="Pro/Business override"><label><input name="enabled" type="checkbox"> enabled</label><button>Save group</button></form></section>
+     <section><h2>Campaign</h2><form id="campaign"><select id="senderAccountId" name="senderAccountId" required><option value="">Sender account</option></select><input name="name" placeholder="Name" required><textarea name="message" placeholder="Message" required></textarea><input name="intervalSeconds" type="number" min="60" value="3600"><input name="chatId" placeholder="Target chatId" required><div class="row"><button>Create and target</button><button type="button" id="schedule">Schedule last</button><button type="button" id="pause">Pause last</button><button type="button" id="cancel">Cancel last</button></div></form><pre id="campaigns"></pre></section>
+    <section><h2>Delivery history</h2><button id="history">Refresh history</button><pre id="deliveries"></pre></section>
+     <script src="https://telegram.org/js/telegram-web-app.js"></script>
+     <script>
+      const state = { tenantId: new URLSearchParams(location.search).get("t") || new URLSearchParams(location.search).get("tenantId") || "", campaignId: null, accountId: "" };
+      const telegram = () => window.Telegram && window.Telegram.WebApp;
+      const headers = () => ({ "content-type": "application/json", "X-Telegram-Init-Data": telegram()?.initData || "" });
+      const path = (suffix) => `/api/tenants/${encodeURIComponent(state.tenantId)}${suffix}`;
+      const call = async (suffix, options = {}) => { const response = await fetch(path(suffix), { ...options, headers: { ...headers(), ...(options.headers || {}) } }); const body = await response.text(); if (!response.ok) throw new Error(body || response.status); return body ? JSON.parse(body) : null; };
+      const show = (id, value) => { document.getElementById(id).textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2); };
+      const values = (id) => Object.fromEntries(new FormData(document.getElementById(id)).entries());
+      document.querySelector('#auth [name="tenantId"]').value = state.tenantId;
+      document.getElementById("auth").onsubmit = (event) => { event.preventDefault(); Object.assign(state, values("auth")); show("status", telegram()?.initData ? "Telegram owner authentication ready" : "Tenant configured; open from Telegram or use an approved proxy that injects the fallback headers"); };
+      const refreshAccounts = async () => { const list = (await call("/accounts")).data; const fill = (id) => { const select = document.getElementById(id); select.replaceChildren(...list.map((account) => { const option = document.createElement("option"); option.value = account.accountId; option.textContent = `${account.phone || account.accountId} (${account.status})`; return option; })); select.value = state.accountId || list[0]?.accountId || ""; }; fill("accountSelect"); fill("senderAccountId"); state.accountId = document.getElementById("accountSelect").value; };
+      document.getElementById("refreshAccounts").onclick = async () => { try { await refreshAccounts(); show("status", "Accounts refreshed"); } catch (error) { show("status", error.message); } };
+      document.getElementById("accountSelect").onchange = (event) => { state.accountId = event.target.value; document.getElementById("senderAccountId").value = state.accountId; };
+      document.getElementById("login").onsubmit = async (event) => { event.preventDefault(); try { const result = await call("/accounts/login", { method: "POST", body: JSON.stringify({ phone: values("login").phone }) }); state.accountId = result.accountId; await refreshAccounts(); show("status", result); } catch (error) { show("status", error.message); } };
+      document.getElementById("code").onsubmit = async (event) => { event.preventDefault(); try { await call(`/accounts/${encodeURIComponent(state.accountId)}/code`, { method: "POST", body: JSON.stringify(values("code")) }); await refreshAccounts(); show("status", "Logged in"); } catch (error) { show("status", error.message); } };
+      document.getElementById("logout").onclick = async () => { try { await call(`/accounts/${encodeURIComponent(state.accountId)}/logout`, { method: "POST" }); await refreshAccounts(); show("status", "Logged out"); } catch (error) { show("status", error.message); } };
+      document.getElementById("deleteAccount").onclick = async () => { try { await call(`/accounts/${encodeURIComponent(state.accountId)}`, { method: "DELETE" }); state.accountId = ""; await refreshAccounts(); show("status", "Account deleted"); } catch (error) { show("status", error.message); } };
+      document.getElementById("sync").onclick = async () => { try { const groups = (await call("/groups/sync", { method: "POST", body: JSON.stringify({ accountId: state.accountId }) })).data; show("groups", groups); const select = document.getElementById("groupSelect"); select.replaceChildren(...groups.map((group) => { const option = document.createElement("option"); option.value = group.chatId; option.textContent = `${group.title} (${group.chatId})`; return option; })); } catch (error) { show("groups", error.message); } };
+      document.getElementById("groupSelect").onchange = (event) => { document.querySelector('#group [name="chatId"]').value = event.target.value; };
+      document.getElementById("group").onsubmit = async (event) => { event.preventDefault(); try { const data = values("group"); await call(`/groups/${encodeURIComponent(state.accountId)}/${encodeURIComponent(data.chatId)}`, { method: "PATCH", body: JSON.stringify({ enabled: data.enabled === "on", messageOverride: data.messageOverride || undefined }) }); show("status", "Group saved"); } catch (error) { show("status", error.message); } };
+      document.getElementById("campaign").onsubmit = async (event) => { event.preventDefault(); try { const data = values("campaign"); const campaign = (await call("/campaigns", { method: "POST", body: JSON.stringify({ name: data.name, message: data.message, senderAccountId: data.senderAccountId, intervalSeconds: Number(data.intervalSeconds) }) })).data; state.campaignId = campaign.id; await call(`/campaigns/${campaign.id}/targets`, { method: "POST", body: JSON.stringify({ chatId: data.chatId }) }); show("campaigns", await call("/campaigns")); } catch (error) { show("campaigns", error.message); } };
+      const campaignAction = (action) => async () => { try { if (!state.campaignId) throw new Error("Create a campaign first"); await call(`/campaigns/${state.campaignId}/${action}`, { method: "POST" }); show("campaigns", await call("/campaigns")); } catch (error) { show("campaigns", error.message); } };
+      document.getElementById("schedule").onclick = campaignAction("schedule"); document.getElementById("pause").onclick = campaignAction("pause"); document.getElementById("cancel").onclick = campaignAction("cancel");
+      document.getElementById("history").onclick = async () => { try { show("deliveries", (await call("/deliveries")).data); } catch (error) { show("deliveries", error.message); } };
+      refreshAccounts().catch((error) => show("status", error.message));
+     </script>
+  </body>
+</html>
