@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0 - 2026-10-18
+
+### Added
+- TDLib user-account client with encrypted persistent account databases.
+- Configurable welcome artwork and expanded dashboard sections.
+
+### Changed
+- Replaced archived GramJS with TDLib; existing linked accounts must sign in again.
+- Bot menus use one-word labels, numbered lists, detailed captions, and styled buttons.
+
 ## 0.5.1 - 2026-10-18
 
 ### Improved

@@ -13,5 +13,5 @@ stored encrypted with `SESSION_ENCRYPTION_KEY`. Mini App API routes verify
 The old proxy headers remain an opt-in fallback with `ADS_OWNER_AUTH_FALLBACK=true`.
 Without a provisioned token, the API fails closed.
 
-`SESSION_ENCRYPTION_KEY` encrypts GramJS StringSession values. Telegram API
+`SESSION_ENCRYPTION_KEY` encrypts TDLib local account databases. Telegram API
 credentials and account sessions are never returned or logged.

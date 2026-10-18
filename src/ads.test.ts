@@ -14,6 +14,7 @@ import { createApiRouter } from "./api.js";
 import { bearerToken, secretMatches } from "./rental/contract.js";
 import { storeControlBotToken } from "./rental/secrets.js";
 import { rawAmount } from "./payments.js";
+import { getTdlibInfo } from "prebuilt-tdlib";
 import express from "express";
 import type { AddressInfo } from "node:net";
 
@@ -21,6 +22,7 @@ const db = openDb(":memory:");
 assert.equal(rawAmount("1000000", 6), 1);
 assert.equal(rawAmount("999999", 6), 0.99);
 assert.equal(Number.isNaN(rawAmount("not-a-number", 6)), true);
+assert.match(getTdlibInfo().version, /^1\.8\./);
 const desired = { tenantId: "tenant-a", productId: "ads", ownerTelegramId: 42, state: "active", tierCode: "starter", runtime: "service", version: 1, trial: false, suspendReason: null, periodEnd: null, retainUntil: null, limits: {}, secretsFingerprint: null, expectData: false, config: {}, updatedAt: new Date().toISOString() } as const;
 config.sessionEncryptionKey = "test-session-key";
 config.telegramApiId = 1;
@@ -64,7 +66,7 @@ assert.deepEqual(adapter.inlineSent.at(-1), { chatId: "-100123", query: `campaig
   assert.equal((await loginStart(db, "tenant-a", `+${nextId}`, nextId)).sent, true);
   db.prepare("UPDATE accounts SET status = 'active', session = 'fake' WHERE tenantId = ? AND accountId = ?").run("tenant-a", nextId);
 }
-await assert.rejects(() => loginStart(db, "tenant-a", "+fourth", "fourth"));
+ await assert.rejects(() => loginStart(db, "tenant-a", "+second", "second"), /already active/);
 assert.throws(() => createCampaign(db, "tenant-a", { name: "Foreign", message: "message", senderAccountId: "missing", intervalSeconds: 60 }));
 db.prepare("INSERT INTO accounts (accountId, tenantId, ownerId, status, createdAt, updatedAt) VALUES (?, ?, ?, 'connecting', ?, ?)").run("login-pending", "tenant-a", 42, new Date().toISOString(), new Date().toISOString());
 setAdapterForTest("tenant-a", "login-pending", new FakeTelegramAdapter());

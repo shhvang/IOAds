@@ -2,7 +2,7 @@
 
 IOAds is a standalone Telegram bot and service for scheduled Telegram group campaigns from
 multiple connected Telegram user accounts within each plan's limit.
-It uses Node.js, TypeScript, Express, GramJS, and a persistent SQLite database.
+It uses Node.js, TypeScript, Express, TDLib, and a persistent SQLite database.
 
 ## Run
 
@@ -15,7 +15,7 @@ npm start
 ```
 
 Copy `.env.example` to `.env`. Set `BOT_TOKEN`, `BOT_OWNER_ID`, and `ADS_ARCHIVE_CHAT` for the standalone bot. The bot must be an admin of `ADS_ARCHIVE_CHAT`, and each connected userbot must be a member with permission to view and forward from it. Grant the bot permission to post in `ADS_PROMO_CHAT` and verify membership checks work for `ADS_FORCE_JOIN_CHAT`. `RENTAL_HUB_URL` and `RENTAL_SECRET` are optional. Set `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and
-`SESSION_ENCRYPTION_KEY` for real account login. Configure one or more payment methods with `BINANCE_PAY_ID` plus read-only API credentials, or receiving addresses plus the corresponding explorer API key. The SQLite file is
+`SESSION_ENCRYPTION_KEY` for real account login and TDLib's encrypted local account database. Configure one or more payment methods with `BINANCE_PAY_ID` plus read-only API credentials, or receiving addresses plus the corresponding explorer API key. The SQLite file is
 `DATA_DIR/ads.db` and should be mounted at `/app/data` in production.
 Plan payments are automatically verified against Binance Pay, BEP20, or TRC20 transaction history. Paid tiers are activated for 30 days after exact amount, destination, transaction status, time window, and uniqueness checks pass.
 Set `RENTAL_SECRET` to comma-separated values during rotation; the first is
@@ -52,8 +52,9 @@ inject the fallback headers so users never have to compute signatures.
 All tenant routes are under `/api/tenants/:tenantId` and require the owner
 boundary above. Routes include account list/login/code/password/logout/delete,
 groups sync and enable/disable, campaign and target CRUD, schedule/pause/cancel,
-and delivery history. Telegram login stores only an encrypted persistent
-GramJS session; passwords, codes, and sessions are never returned.
+and delivery history. TDLib keeps each account's encrypted local database under
+`DATA_DIR/tdlib`; bot login codes, passwords, and TDLib keys are never returned.
+Existing GramJS sessions must be connected again; new TDLib sessions persist.
 
 Groups are limited to dialogs already visible to the connected user account.
 The service does not join groups, scrape members, discover chats, or send DMs.

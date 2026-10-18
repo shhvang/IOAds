@@ -14,6 +14,7 @@ export const config = {
   telegramApiRoot: process.env.TELEGRAM_API_ROOT ?? "https://api.telegram.org",
   botOwnerId: Number(process.env.BOT_OWNER_ID ?? 0),
   botUsername: process.env.ADS_BOT_USERNAME ?? "",
+  welcomeImage: process.env.ADS_WELCOME_IMAGE ?? "",
   forceJoinChat: process.env.ADS_FORCE_JOIN_CHAT ?? "@iobuysell",
   promoChat: process.env.ADS_PROMO_CHAT ?? "@iobuysell",
   archiveChat: process.env.ADS_ARCHIVE_CHAT ?? "",

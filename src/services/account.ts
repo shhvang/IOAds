@@ -44,15 +44,15 @@ export function requireAccount(db: Database.Database, tenantId: string, accountI
 
 export function adapterFor(db: Database.Database, tenantId: string, accountId: string): TelegramAdapter {
   const adapterKey = key(tenantId, accountId);
-  const row = db.prepare("SELECT session, status FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { session: string | null; status: string } | undefined;
+  const row = db.prepare("SELECT status, session FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { status: string; session: string | null } | undefined;
   if (!row) throw new Error("account not found");
   const cached = adapters.get(adapterKey);
-  if (cached && (row.status === "active" || row.status === "connecting" || row.session)) return cached;
+  if (cached && (row.status === "connecting" || row.status === "active" || Boolean(row.session))) return cached;
   if (cached) {
     adapters.delete(adapterKey);
     void cached.logout().catch(() => undefined);
   }
-  const adapter = createTelegramAdapter(row.session);
+  const adapter = createTelegramAdapter(accountId);
   adapters.set(adapterKey, adapter);
   return adapter;
 }
@@ -75,8 +75,8 @@ export async function loginStart(db: Database.Database, tenantId: string, phone:
     return { accountId, sent: true };
   } catch (error) {
     db.prepare("UPDATE accounts SET status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(now(), tenantId, accountId);
-    adapters.delete(key(tenantId, accountId));
     await adapter.logout().catch(() => undefined);
+    adapters.delete(key(tenantId, accountId));
     throw error;
   }
 }

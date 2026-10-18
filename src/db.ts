@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS localUsers (telegramId INTEGER PRIMARY KEY, tenantId 
 CREATE TABLE IF NOT EXISTS planPayments (id INTEGER PRIMARY KEY, telegramId INTEGER NOT NULL, tierCode TEXT NOT NULL, network TEXT NOT NULL, amount REAL NOT NULL, reference TEXT NOT NULL UNIQUE, externalId TEXT UNIQUE, createdAt TEXT NOT NULL, expiresAt TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS accounts (
   accountId TEXT PRIMARY KEY, tenantId TEXT NOT NULL, ownerId INTEGER NOT NULL, phone TEXT, telegramUserId INTEGER,
-  session TEXT, status TEXT NOT NULL DEFAULT 'logged_out', loginPhone TEXT,
+  session TEXT, sessionType TEXT NOT NULL DEFAULT 'tdlib', status TEXT NOT NULL DEFAULT 'logged_out', loginPhone TEXT,
   phoneCodeHash TEXT, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL,
   UNIQUE (tenantId, accountId),
   FOREIGN KEY (tenantId) REFERENCES tenants(tenantId) ON DELETE CASCADE
@@ -76,6 +76,18 @@ export function openDb(path: string): Database.Database {
   const tenantColumns = db.prepare("PRAGMA table_info(tenants)").all() as Array<{ name: string }>;
   if (!tenantColumns.some((column) => column.name === "controlBotFingerprint")) db.exec("ALTER TABLE tenants ADD COLUMN controlBotFingerprint TEXT");
   if (!tenantColumns.some((column) => column.name === "controlBotToken")) db.exec("ALTER TABLE tenants ADD COLUMN controlBotToken TEXT");
+  const accountColumns = db.prepare("PRAGMA table_info(accounts)").all() as Array<{ name: string }>;
+  if (!accountColumns.some((column) => column.name === "sessionType")) {
+    db.exec("ALTER TABLE accounts ADD COLUMN sessionType TEXT NOT NULL DEFAULT 'gramjs'");
+  }
+  const migrated = db.prepare("SELECT tenantId, accountId FROM accounts WHERE session IS NOT NULL AND session NOT LIKE 'tdlib:%'").all() as Array<{ tenantId: string; accountId: string }>;
+  db.transaction(() => {
+    for (const account of migrated) {
+      db.prepare("UPDATE accounts SET session = NULL, status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, sessionType = 'tdlib', updatedAt = ? WHERE tenantId = ? AND accountId = ?").run(new Date().toISOString(), account.tenantId, account.accountId);
+      db.prepare("UPDATE groups SET enabled = 0 WHERE tenantId = ? AND accountId = ?").run(account.tenantId, account.accountId);
+      db.prepare("UPDATE campaignTargets SET enabled = 0 WHERE tenantId = ? AND accountId = ?").run(account.tenantId, account.accountId);
+    }
+  })();
   const campaignColumns = db.prepare("PRAGMA table_info(campaigns)").all() as Array<{ name: string }>;
   if (!campaignColumns.some((column) => column.name === "messageEntities")) db.exec("ALTER TABLE campaigns ADD COLUMN messageEntities TEXT NOT NULL DEFAULT '[]'");
   if (!campaignColumns.some((column) => column.name === "promoNextAt")) db.exec("ALTER TABLE campaigns ADD COLUMN promoNextAt TEXT");

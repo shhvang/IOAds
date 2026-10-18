@@ -25,6 +25,7 @@ const icon = {
   cancel: "5985346521103604145",
   settings: "5877260593903177342",
   schedule: "5967412305338568701",
+  activity: "6008163345885040772",
 } as const;
 
 const button = (text: string, callback_data: string, key: keyof typeof icon, style: ButtonStyle = "primary"): InlineKeyboardButton => ({
@@ -33,6 +34,10 @@ const button = (text: string, callback_data: string, key: keyof typeof icon, sty
 
 function menu(rows: InlineKeyboardButton[][]): InlineKeyboard {
   return new InlineKeyboard(rows);
+}
+
+function escapeHtml(value: unknown): string {
+  return String(value).replace(/[&<>]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[char]!);
 }
 
 function loginError(error: unknown): string {
@@ -58,9 +63,11 @@ export function startAdsBot(db: Database.Database): void {
     return row.tenantId;
   };
   const home = () => menu([
-    [button("Create campaign", "campaigns", "campaign", "success")],
-    [button("Userbots", "accounts", "users"), button("Groups", "groups", "group")],
-    [button("Plan & usage", "plan", "plan"), button("Help", "help", "help")],
+    [button("Start", "newcampaign", "campaign", "success")],
+    [button("Campaigns", "campaigns", "campaign"), button("Accounts", "accounts", "users")],
+    [button("Groups", "groups", "group"), button("Schedule", "schedule", "schedule")],
+    [button("Activity", "activity", "activity"), button("Plan", "plan", "plan")],
+    [button("Settings", "settings", "settings"), button("Help", "help", "help")],
   ]);
   const showHome = async (ctx: Context) => {
     const userId = ctx.from?.id;
@@ -70,7 +77,10 @@ export function startAdsBot(db: Database.Database): void {
     const sentToday = (db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE tenantId = ? AND status='sent' AND sentAt >= date('now')").get(tid) as { n: number }).n;
     const limits = tierLimits(user.tierCode);
     const connected = accounts(db, tid).filter((a) => a.status === "active").length;
-    await ctx.reply(`<tg-emoji emoji-id="${icon.campaign}">📢</tg-emoji> <b>Campaign control</b>\n${connected ? "Your posting accounts are ready." : "No posting account linked yet."}\n\n<b>Today</b>  ${sentToday.toLocaleString()}/${limits.dailyMessages.toLocaleString()} messages\n<b>Userbots</b>  ${connected}/${limits.accounts} connected`, { parse_mode: "HTML", reply_markup: home() });
+    const running = Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId = ? AND status = 'scheduled'").get(tid) as { n: number }).n);
+    const caption = `<tg-emoji emoji-id="${icon.campaign}">📢</tg-emoji> <b>Welcome to IOAds</b>\nPlan and manage Telegram campaigns from one place. Link an account, pick groups it already belongs to, then schedule your first ad.\n\n<b>Accounts</b>  ${connected}/${limits.accounts} connected\n<b>Campaigns</b>  ${running} scheduled\n<b>Today</b>  ${sentToday.toLocaleString()}/${limits.dailyMessages.toLocaleString()} messages\n\nStart a campaign, review your groups, or explore your plan and activity below.`;
+    if (config.welcomeImage) await ctx.replyWithPhoto(config.welcomeImage, { caption, parse_mode: "HTML", reply_markup: home() });
+    else await ctx.reply(caption, { parse_mode: "HTML", reply_markup: home() });
   };
   bot.use(async (ctx, next) => {
     const flow = ctx.from ? flows.get(ctx.from.id) : undefined;
@@ -84,12 +94,12 @@ export function startAdsBot(db: Database.Database): void {
         const member = await ctx.api.getChatMember(config.forceJoinChat, ctx.from.id);
          if (member.status === "left" || member.status === "kicked" || (member.status === "restricted" && !member.is_member)) {
           db.prepare("UPDATE localUsers SET forceJoined = 0, updatedAt = ? WHERE telegramId = ?").run(now(), ctx.from.id);
-          await ctx.reply("Join @iobuysell to use your userbots.", { reply_markup: menu([[{ text: "Join @iobuysell", url: "https://t.me/iobuysell", icon_custom_emoji_id: icon.group, style: "primary" }], [button("Check membership", "home", "check", "success")]]) });
+          await ctx.reply("Join @iobuysell to use your userbots.", { reply_markup: menu([[{ text: "Join", url: "https://t.me/iobuysell", icon_custom_emoji_id: icon.group, style: "primary" }], [button("Check", "home", "check", "success")]]) });
           return;
         }
         db.prepare("UPDATE localUsers SET forceJoined = 1, updatedAt = ? WHERE telegramId = ?").run(now(), ctx.from.id);
       } catch {
-        await ctx.reply("I can’t verify your @iobuysell membership yet. Open the group, then try again.", { reply_markup: menu([[{ text: "Open @iobuysell", url: "https://t.me/iobuysell", icon_custom_emoji_id: icon.group, style: "primary" }]]) });
+         await ctx.reply("I can’t verify your @iobuysell membership yet. Open the group, then try again.", { reply_markup: menu([[{ text: "Open", url: "https://t.me/iobuysell", icon_custom_emoji_id: icon.group, style: "primary" }]]) });
         return;
       }
     }
@@ -104,7 +114,7 @@ export function startAdsBot(db: Database.Database): void {
     try {
       const member = await ctx.api.getChatMember(config.forceJoinChat, userId);
        if (member.status === "left" || member.status === "kicked" || (member.status === "restricted" && !member.is_member)) {
-         await ctx.reply("Join @iobuysell to activate campaigns. Your free ads are also posted there every 10 minutes.", { reply_markup: menu([[{ text: "Join @iobuysell", url: "https://t.me/iobuysell", icon_custom_emoji_id: icon.group, style: "primary" }], [button("I joined", "home", "check", "success")]]) });
+          await ctx.reply("Join @iobuysell to activate campaigns. Your free ads are also posted there every 10 minutes.", { reply_markup: menu([[{ text: "Join", url: "https://t.me/iobuysell", icon_custom_emoji_id: icon.group, style: "primary" }], [button("Check", "home", "check", "success")]]) });
         return;
       }
       db.prepare("UPDATE localUsers SET forceJoined = 1, updatedAt = ? WHERE telegramId = ?").run(now(), userId);
@@ -115,25 +125,35 @@ export function startAdsBot(db: Database.Database): void {
     await showHome(ctx);
   });
   bot.command("menu", showHome);
-  bot.command("help", (ctx) => ctx.reply("Connect a userbot, sync its groups, then create a campaign from a message. Campaigns run every 5–60 minutes. Every campaign also posts to @iobuysell every 10 minutes."));
-  bot.callbackQuery("help", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>How IOAds works</b>\nConnect a userbot, choose groups it already belongs to, then schedule ads from a forwarded message.\n\nYour campaigns post on the interval you choose. Free-plan campaigns also appear in @iobuysell.", { parse_mode: "HTML", reply_markup: menu([[button("Add userbot", "accounts", "users", "success")], [button("Back", "home", "back")]]) }); });
+  bot.command("help", (ctx) => ctx.reply("Welcome to IOAds. Connect a Telegram account, choose groups it already belongs to, then forward an ad to create a campaign. Set its schedule and delivery method, and review activity any time from the dashboard."));
+  bot.callbackQuery("help", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>Getting started</b>\nConnect an account, sync its existing groups, then forward the message you want to promote. Choose targets, set an interval from 5 minutes to 1 hour, and schedule it.\n\nAccounts remain yours: IOAds only uses groups visible to the account and never joins groups or messages members.", { parse_mode: "HTML", reply_markup: menu([[button("Start", "newcampaign", "campaign", "success")], [button("Accounts", "accounts", "users"), button("Groups", "groups", "group")], [button("Home", "home", "back")]]) }); });
+  bot.callbackQuery("schedule", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>Schedule</b>\nReview campaign status, delivery interval, target groups, and posting method. Open any campaign to pause it or change its timing.", { parse_mode: "HTML", reply_markup: menu([[button("Campaigns", "campaigns", "campaign", "primary")], [button("Start", "newcampaign", "add", "success")], [button("Home", "home", "back")]]) }); });
+  bot.callbackQuery("activity", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    const rows = db.prepare("SELECT c.name, d.chatId, d.status, d.sentAt FROM deliveries d JOIN campaigns c ON c.id = d.campaignId WHERE d.tenantId = ? ORDER BY d.id DESC LIMIT 8").all(tenantId(ctx.from.id)) as Array<{ name: string; chatId: string; status: string; sentAt: string | null }>;
+    const body = rows.length ? rows.map((row) => `• <b>${escapeHtml(row.name)}</b> · ${row.status} · ${escapeHtml(row.chatId)}`).join("\n") : "No deliveries yet. Completed sends will appear here.";
+    await ctx.editMessageText(`<tg-emoji emoji-id="${icon.activity}">🗃</tg-emoji> <b>Activity</b>\nRecent campaign deliveries\n\n${body}`, { parse_mode: "HTML", reply_markup: menu([[button("Campaigns", "campaigns", "campaign")], [button("Home", "home", "back")]]) });
+  });
+  bot.callbackQuery("settings", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>Settings</b>\nManage linked Telegram accounts, group access, plan limits, and campaign delivery preferences.", { parse_mode: "HTML", reply_markup: menu([[button("Accounts", "accounts", "users"), button("Groups", "groups", "group")], [button("Plan", "plan", "plan"), button("Home", "home", "back")]]) }); });
   bot.callbackQuery("accounts", async (ctx) => {
     await ctx.answerCallbackQuery();
     const list = accounts(db, tenantId(ctx.from.id));
-    const keyboard = menu([[button("Add userbot", "connect", "add", "success")], ...list.map((account) => [button(`${account.phone ?? account.accountId} · ${account.status}`, `account:${account.accountId}`, account.status === "active" ? "check" : "users")]), [button("Back", "home", "back")]]);
-    await ctx.editMessageText(`<tg-emoji emoji-id="${icon.users}">👥</tg-emoji> <b>Userbots</b>\n${list.length ? `${list.filter((a) => a.status === "active").length} connected` : "Connect an account to start posting."}`, { parse_mode: "HTML", reply_markup: keyboard });
+    const keyboard = menu([[button("Add", "connect", "add", "success")], ...list.map((account, index) => [button(String(index + 1), `account:${account.accountId}`, account.status === "active" ? "check" : "users")]), [button("Back", "home", "back")]]);
+    const lines = list.map((account, index) => `${index + 1}. <b>${account.phone ?? "Telegram account"}</b> · ${account.status}`);
+    await ctx.editMessageText(`<tg-emoji emoji-id="${icon.users}">👥</tg-emoji> <b>Accounts</b>\n${lines.length ? `${lines.length} linked account${lines.length === 1 ? "" : "s"}. Select a number to manage it.\n\n${lines.join("\n")}` : "Connect a Telegram account to select groups and send scheduled campaigns."}`, { parse_mode: "HTML", reply_markup: keyboard });
   });
   bot.callbackQuery(/^account:(.+)$/, async (ctx) => {
     const accountId = ctx.match[1]!;
-    const keyboard = menu([[button("Log out", `logout:${accountId}`, "cancel", "danger")], [button("Back", "accounts", "back")]]);
+    const keyboard = menu([[button("Logout", `logout:${accountId}`, "cancel", "danger")], [button("Back", "accounts", "back")]]);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(`<tg-emoji emoji-id="${icon.users}">👥</tg-emoji> <b>Userbot settings</b>\nChoose an action for this account.`, { parse_mode: "HTML", reply_markup: keyboard });
+    const account = accounts(db, tenantId(ctx.from.id)).find((item) => item.accountId === accountId);
+    await ctx.editMessageText(`<tg-emoji emoji-id="${icon.users}">👥</tg-emoji> <b>Account</b>\n${account?.phone ?? "Telegram account"}\nStatus: ${account?.status ?? "unknown"}\n\nLogging out pauses campaigns that use this account.`, { parse_mode: "HTML", reply_markup: keyboard });
   });
   bot.callbackQuery(/^logout:(.+)$/, async (ctx) => {
     try {
       await logout(db, tenantId(ctx.from.id), ctx.match[1]!);
       await ctx.answerCallbackQuery("Userbot logged out");
-      await ctx.editMessageText("Userbot logged out. Scheduled campaigns using it are paused until it reconnects.", { reply_markup: home() });
+      await ctx.editMessageText("Account logged out. Campaigns using it will wait until the account reconnects.", { reply_markup: menu([[button("Accounts", "accounts", "users")], [button("Home", "home", "back")]]) });
     } catch (error) {
       await ctx.answerCallbackQuery({ text: String(error instanceof Error ? error.message : error), show_alert: true });
     }
@@ -141,31 +161,25 @@ export function startAdsBot(db: Database.Database): void {
   bot.callbackQuery("connect", async (ctx) => {
     await ctx.answerCallbackQuery();
     if (["phone", "sending_code", "code", "password", "verifying_code"].includes(flows.get(ctx.from.id)?.action ?? "")) {
-      await ctx.reply("A userbot login is already in progress. Finish it or cancel it first.", { reply_markup: menu([[button("Cancel login", "login:cancel", "cancel", "danger")]]) });
+      await ctx.reply("A login is already in progress. Finish it or cancel it before starting another account.", { reply_markup: menu([[button("Cancel", "login:cancel", "cancel", "danger")]]) });
       return;
     }
     flows.set(ctx.from.id, { action: "phone" });
-    await ctx.reply(`<tg-emoji emoji-id="${icon.users}">👥</tg-emoji> <b>Link a userbot</b>\nEnter its phone number with country code, such as <code>+1234567890</code>. Telegram will send a sign-in code to that account.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel", "cancel", "danger")]]) });
+    await ctx.reply(`<tg-emoji emoji-id="${icon.users}">👥</tg-emoji> <b>Connect an account</b>\nEnter the phone number with its country code. Telegram will send a sign-in code to your account, either in Telegram or by SMS. Your encrypted account database stays on this service.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel", "cancel", "danger")]]) });
   });
   bot.callbackQuery("login:cancel", async (ctx) => {
     const flow = flows.get(ctx.from.id);
     if (flow?.accountId && ["sending_code", "code", "password", "verifying_code"].includes(flow.action)) await cancelLogin(db, tenantId(ctx.from.id), flow.accountId);
     flows.delete(ctx.from.id);
     await ctx.answerCallbackQuery("Login cancelled");
-    await ctx.editMessageText("Userbot login cancelled.", { reply_markup: menu([[button("Userbots", "accounts", "users", "primary")], [button("Dashboard", "home", "back")]]) });
+    await ctx.editMessageText("Account login cancelled. No account was connected.", { reply_markup: menu([[button("Accounts", "accounts", "users", "primary")], [button("Home", "home", "back")]]) });
   });
   bot.callbackQuery("campaigns", async (ctx) => {
     await ctx.answerCallbackQuery();
     const tid = tenantId(ctx.from.id), list = listCampaigns(db, tid) as Array<{ id: number; name: string; status: string; intervalSeconds: number }>;
-    const keyboard = menu([[button("New campaign", "newcampaign", "add", "success")], ...list.slice(0, 8).map((c) => [button(`${c.name} · ${c.status} · ${c.intervalSeconds / 60}m`, `campaign:${c.id}`, "campaign")]), [button("Back", "home", "back")]]);
-    await ctx.editMessageText(`<tg-emoji emoji-id="${icon.campaign}">📢</tg-emoji> <b>Campaigns</b>\n${list.length ? `${list.length} campaigns` : "No campaigns yet. Create one to schedule your first ad."}`, { parse_mode: "HTML", reply_markup: keyboard });
-  });
-  bot.callbackQuery("newcampaign", async (ctx) => {
-    const tid = tenantId(ctx.from.id), list = accounts(db, tid).filter((a) => a.status === "active");
-    await ctx.answerCallbackQuery();
-    if (!list.length) return ctx.reply("No userbot linked yet. Add one before creating a campaign.", { reply_markup: menu([[button("Add userbot", "accounts", "users", "success")], [button("Back", "home", "back")]]) });
-    flows.set(ctx.from.id, { action: "campaign", accountId: list[0]!.accountId });
-    await ctx.reply("<b>New campaign</b>\nForward the ad you want to send. Its formatting and media will be preserved.", { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "home", "cancel", "danger")]]) });
+    const keyboard = menu([[button("Start", "newcampaign", "add", "success")], ...list.slice(0, 8).map((c, index) => [button(String(index + 1), `campaign:${c.id}`, "campaign")]), [button("Back", "home", "back")]]);
+    const body = list.slice(0, 8).map((c, index) => `${index + 1}. <b>${escapeHtml(c.name)}</b> · ${c.status} · every ${c.intervalSeconds / 60}m`).join("\n");
+    await ctx.editMessageText(`<tg-emoji emoji-id="${icon.campaign}">📢</tg-emoji> <b>Campaigns</b>\n${list.length ? `${list.length} campaign${list.length === 1 ? "" : "s"}. Select a number to review its schedule and delivery settings.\n\n${body}` : "No campaigns yet. Create one by forwarding your ad, then choose where and how often it should post."}`, { parse_mode: "HTML", reply_markup: keyboard });
   });
   bot.inlineQuery(/.*/, async (ctx) => {
     const user = db.prepare("SELECT tenantId FROM localUsers WHERE telegramId = ? AND forceJoined = 1").get(ctx.from.id) as { tenantId: string } | undefined;
@@ -180,14 +194,21 @@ export function startAdsBot(db: Database.Database): void {
         : []) as Array<{ id: number; name: string; message: string; messageEntities: string; richMessage: string | null }>;
     await ctx.answerInlineQuery(campaigns.map((campaign) => ({ type: "article" as const, id: String(campaign.id), title: campaign.name, description: campaign.message.slice(0, 100), input_message_content: campaign.richMessage ? { rich_message: JSON.parse(campaign.richMessage) } : { message_text: campaign.message, entities: JSON.parse(campaign.messageEntities) } })), { cache_time: 0, is_personal: true });
   });
+  bot.callbackQuery("newcampaign", async (ctx) => {
+    const list = accounts(db, tenantId(ctx.from.id)).filter((a) => a.status === "active");
+    await ctx.answerCallbackQuery();
+    if (!list.length) return ctx.reply("Connect an account before creating a campaign.", { reply_markup: menu([[button("Add", "connect", "users", "success")], [button("Back", "home", "back")]]) });
+    flows.set(ctx.from.id, { action: "campaign", accountId: list[0]!.accountId });
+    await ctx.reply("<b>New campaign</b>\nForward the original ad message here. Text, formatting, photos, videos, and supported rich content are preserved. You can choose the groups and schedule next.", { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "home", "cancel", "danger")]]) });
+  });
   bot.callbackQuery(/^campaign:(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const id = Number(ctx.match[1]), campaign = db.prepare("SELECT name, status, intervalSeconds FROM campaigns WHERE tenantId = ? AND id = ?").get(tenantId(ctx.from.id), id) as { name: string; status: string; intervalSeconds: number } | undefined;
     if (!campaign) return ctx.reply("Campaign not found.");
     const action = campaign.status === "scheduled" ? "pause" : "schedule";
     const inline = db.prepare("SELECT inlineMode FROM campaigns WHERE tenantId = ? AND id = ?").get(tenantId(ctx.from.id), id) as { inlineMode: number };
-    const rows: InlineKeyboardButton[][] = [[button(action === "pause" ? "Pause" : "Schedule", `setcampaign:${id}:${action}`, action === "pause" ? "schedule" : "check", "success"), button("Cancel", `setcampaign:${id}:cancel`, "cancel", "danger")], [button("5 min", `interval:${id}:300`, "schedule"), button("30 min", `interval:${id}:1800`, "schedule"), button("1 hour", `interval:${id}:3600`, "schedule")]];
-    if (!['free', 'starter'].includes((db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { tierCode: string }).tierCode)) rows.push([button(inline.inlineMode ? "Use direct userbot" : "Use bot inline via userbot", `inline:${id}`, "settings")]);
+    const rows: InlineKeyboardButton[][] = [[button(action === "pause" ? "Pause" : "Schedule", `setcampaign:${id}:${action}`, action === "pause" ? "schedule" : "check", "success"), button("Cancel", `setcampaign:${id}:cancel`, "cancel", "danger")], [button("5m", `interval:${id}:300`, "schedule"), button("30m", `interval:${id}:1800`, "schedule"), button("60m", `interval:${id}:3600`, "schedule")]];
+    if (!['free', 'starter'].includes((db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { tierCode: string }).tierCode)) rows.push([button(inline.inlineMode ? "Direct" : "Inline", `inline:${id}`, "settings")]);
     rows.push([button("Back", "campaigns", "back")]);
     const keyboard = menu(rows);
     await ctx.editMessageText(`<b>${campaign.name}</b>\nStatus: ${campaign.status}\nInterval: ${campaign.intervalSeconds / 60} minutes\nPosting: ${inline.inlineMode ? "bot inline via userbot" : "direct userbot"}`, { parse_mode: "HTML", reply_markup: keyboard });
@@ -196,6 +217,8 @@ export function startAdsBot(db: Database.Database): void {
     const [, id, seconds] = ctx.match;
     db.prepare("UPDATE campaigns SET intervalSeconds = ?, nextRunAt = NULL, updatedAt = ? WHERE tenantId = ? AND id = ?").run(Number(seconds), now(), tenantId(ctx.from.id), Number(id));
     await ctx.answerCallbackQuery("Interval updated");
+    const campaign = db.prepare("SELECT name, status FROM campaigns WHERE tenantId = ? AND id = ?").get(tenantId(ctx.from.id), Number(id)) as { name: string; status: string } | undefined;
+    if (campaign) await ctx.editMessageText(`<b>${escapeHtml(campaign.name)}</b>\nStatus: ${campaign.status}\nInterval: ${Number(seconds) / 60} minutes`, { parse_mode: "HTML", reply_markup: menu([[button("Schedule", `setcampaign:${id}:schedule`, "check", "success"), button("Cancel", `setcampaign:${id}:cancel`, "cancel", "danger")], [button("5m", `interval:${id}:300`, "schedule"), button("30m", `interval:${id}:1800`, "schedule"), button("60m", `interval:${id}:3600`, "schedule")], [button("Back", `campaign:${id}`, "back")]]) });
   });
   bot.callbackQuery(/^inline:(\d+)$/, async (ctx) => {
     const id = Number(ctx.match[1]);
@@ -211,11 +234,12 @@ export function startAdsBot(db: Database.Database): void {
   bot.callbackQuery("groups", async (ctx) => {
     const tid = tenantId(ctx.from.id), list = accounts(db, tid).filter((a) => a.status === "active");
     await ctx.answerCallbackQuery();
-    if (!list.length) return ctx.reply("No userbot linked yet.", { reply_markup: menu([[button("Add userbot", "accounts", "users", "success")]]) });
+    if (!list.length) return ctx.reply("No account linked yet.", { reply_markup: menu([[button("Add", "connect", "users", "success")]]) });
     const groups = await syncGroups(db, tid, list[0]!.accountId) as Array<{ chatId: string; title: string; enabled: number }>;
-    const rows = groups.slice(0, 30).map((group) => [button(`${group.enabled ? "✓" : "○"} ${group.title}`.slice(0, 60), `group:${list[0]!.accountId}:${group.chatId}:${group.enabled ? 0 : 1}`, "group", group.enabled ? "success" : "primary")]);
+    const rows = groups.slice(0, 30).map((group, index) => [button(String(index + 1), `group:${list[0]!.accountId}:${group.chatId}:${group.enabled ? 0 : 1}`, "group", group.enabled ? "success" : "primary")]);
     rows.push([button("Back", "home", "back")]);
-    await ctx.reply("<b>Campaign groups</b>\nChoose which groups can receive ads.", { parse_mode: "HTML", reply_markup: menu(rows) });
+    const body = groups.slice(0, 30).map((group, index) => `${index + 1}. <b>${escapeHtml(group.title)}</b> · ${group.enabled ? "included" : "excluded"}`).join("\n");
+    await ctx.reply(`<b>Groups</b>\nSelect a group number to toggle campaign delivery. Only chats already visible to your account are listed.\n\n${body || "No eligible groups found. Sync the account after joining groups from Telegram."}`, { parse_mode: "HTML", reply_markup: menu(rows) });
   });
   bot.callbackQuery(/^group:([^:]+):([^:]+):(0|1)$/, async (ctx) => {
     const [, accountId, chatId, enabled] = ctx.match;
@@ -228,7 +252,7 @@ export function startAdsBot(db: Database.Database): void {
     await ctx.answerCallbackQuery();
     const row = db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { tierCode: string };
     const expires = db.prepare("SELECT paidUntil FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { paidUntil: string | null };
-    const rows = [[button("Pro · $1/month", "upgrade:pro", "plan", "primary")], [button("Business · $3/month", "upgrade:business", "plan", "success")], [button("Back", "home", "back")]];
+    const rows = [[button("Pro", "upgrade:pro", "plan", "primary")], [button("Business", "upgrade:business", "plan", "success")], [button("Back", "home", "back")]];
     await ctx.editMessageText(`<tg-emoji emoji-id="${icon.plan}">💳</tg-emoji> <b>${row.tierCode} plan</b>${expires.paidUntil ? ` · until ${new Date(expires.paidUntil).toLocaleDateString()}` : ""}\n\nFree · 500 messages/day · 1 userbot\nPro · 2,000/day · 5 userbots\nBusiness · 10,000/day · 15 userbots\n\nPayments are verified automatically.`, { parse_mode: "HTML", reply_markup: menu(rows) });
   });
   bot.callbackQuery(/^upgrade:(pro|business)$/, async (ctx) => {
@@ -238,7 +262,7 @@ export function startAdsBot(db: Database.Database): void {
     const available = paymentMethods();
     if (!available.length) return ctx.answerCallbackQuery({ text: "Payments aren’t configured yet. Ask the bot owner.", show_alert: true });
     await ctx.answerCallbackQuery();
-    const rows = available.map((method) => [button(method === "Binance" ? "Binance Pay" : `USDT ${method}`, `pay:${tier}:${method}`, "plan")]);
+    const rows = available.map((method) => [button(method === "Binance" ? "Binance" : method, `pay:${tier}:${method}`, "plan")]);
     rows.push([button("Back", "plan", "back")]);
     const keyboard = menu(rows);
     await ctx.reply(`<b>${tier} · $${monthly}/month</b>\nChoose a payment method. Access begins after the transfer is verified.`, { parse_mode: "HTML", reply_markup: keyboard });
@@ -253,7 +277,7 @@ export function startAdsBot(db: Database.Database): void {
     const id = Number(db.prepare("INSERT INTO planPayments (telegramId, tierCode, network, amount, reference, createdAt, expiresAt) VALUES (?, ?, ?, ?, ?, ?, ?)").run(ctx.from.id, tier, method, amount, reference, timestamp, expiresAt).lastInsertRowid);
     flows.set(ctx.from.id, { action: "payment", tier, method, paymentId: id });
     await ctx.answerCallbackQuery();
-     await ctx.reply(`<b>Pay $${amount} · ${method}</b>\n\n${address}\n\n${method === "Binance" ? "Send USDT with Binance Pay." : "Send USDT on the selected network."}\nThen send the Order ID or transaction hash here. This request expires in 30 minutes.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "plan", "cancel", "danger")]]) });
+      await ctx.reply(`<b>Pay $${amount} · ${method}</b>\n\n${address}\n\n${method === "Binance" ? "Send USDT with Binance Pay." : "Send USDT on the selected network."}\nThen send the Order ID or transaction hash here. This request expires in 30 minutes.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "plan", "cancel", "danger")]]) });
   });
   bot.callbackQuery("home", async (ctx) => { flows.delete(ctx.from.id); await ctx.answerCallbackQuery(); await showHome(ctx); });
   bot.callbackQuery(/^target:(\d+):([^:]+)$/, async (ctx) => {
@@ -303,7 +327,7 @@ export function startAdsBot(db: Database.Database): void {
           }
           flows.set(ctx.from.id, { action: "code", accountId: result.accountId, phone });
           clearInterval(progressTimer);
-          await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "Login code requested. Check Telegram on the account you’re connecting, then send the code here. If asked, include your 2FA password after the code, separated by a space.", { reply_markup: menu([[button("Cancel login", "login:cancel", "cancel", "danger")]]) });
+           await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "Code requested. Check the account’s Telegram app or SMS, then send the code here. If Telegram asks for your 2FA password, send that in the next message.", { reply_markup: menu([[button("Cancel", "login:cancel", "cancel", "danger")]]) });
         } finally {
           clearInterval(progressTimer);
           clearInterval(action);
@@ -337,10 +361,10 @@ export function startAdsBot(db: Database.Database): void {
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           if (String(error).toUpperCase().includes("SESSION_PASSWORD_NEEDED") && flow.action === "code") {
             flows.set(ctx.from.id, { ...flow, action: "password", code: code! });
-            await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "This account uses 2FA. Send its password to finish connecting.", { reply_markup: menu([[button("Cancel login", "login:cancel", "cancel", "danger")]]) });
+             await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "Two-step verification is enabled. Send the account password to finish connecting.", { reply_markup: menu([[button("Cancel", "login:cancel", "cancel", "danger")]]) });
           } else {
             flows.set(ctx.from.id, { ...flow, action: flow.action === "password" ? "password" : "code", code: flow.action === "password" ? flow.code : code });
-            await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `Could not verify this login: ${loginError(error)}\nTry again or cancel the login.`, { reply_markup: menu([[button("Cancel login", "login:cancel", "cancel", "danger")]]) });
+             await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `Could not verify this login: ${loginError(error)}\nTry again or cancel the login.`, { reply_markup: menu([[button("Cancel", "login:cancel", "cancel", "danger")]]) });
           }
         } finally {
           clearInterval(progressTimer);
@@ -372,7 +396,7 @@ export function startAdsBot(db: Database.Database): void {
     } catch (error) {
       if (["phone", "sending_code"].includes(flows.get(ctx.from.id)?.action ?? "")) {
         flows.set(ctx.from.id, { action: "phone" });
-        await ctx.reply(`Could not request a login code: ${loginError(error)}\nCheck the number and try again, or cancel the login.`, { reply_markup: menu([[button("Cancel login", "login:cancel", "cancel", "danger")]]) });
+         await ctx.reply(`Could not request a login code: ${loginError(error)}\nCheck the number and try again, or cancel the login.`, { reply_markup: menu([[button("Cancel", "login:cancel", "cancel", "danger")]]) });
       } else {
         await ctx.reply(String(error instanceof Error ? error.message : error));
       }
@@ -390,9 +414,10 @@ export function startAdsBot(db: Database.Database): void {
       .run(JSON.stringify(msg.entities ?? msg.caption_entities ?? []), config.archiveChat || String(ctx.from.id), archived.message_id, msg.rich_message ? JSON.stringify(msg.rich_message) : null, plan === "free" || plan === "starter" ? 1 : 0, created.id, tid);
     flows.delete(ctx.from.id);
     const groups = await syncGroups(db, tid, flow.accountId!) as Array<{ chatId: string; title: string }>;
-    const rows = groups.slice(0, 25).map((group) => [button(group.title.slice(0, 35), `target:${created.id}:${group.chatId}`, "group")]);
-    rows.push([button("Open campaigns", "campaigns", "campaign", "success")]);
-    await ctx.reply(`<tg-emoji emoji-id="${icon.campaign}">📢</tg-emoji> <b>Campaign saved</b>\n${plan === "free" || plan === "starter" ? "Select groups for delivery through the bot." : "Choose the groups that should receive this ad."}`, { parse_mode: "HTML", reply_markup: menu(rows) });
+    const rows = groups.slice(0, 25).map((group, index) => [button(String(index + 1), `target:${created.id}:${group.chatId}`, "group")]);
+    rows.push([button("Campaigns", "campaigns", "campaign", "success")]);
+    const names = groups.slice(0, 25).map((group, index) => `${index + 1}. ${escapeHtml(group.title)}`).join("\n");
+    await ctx.reply(`<tg-emoji emoji-id="${icon.campaign}">📢</tg-emoji> <b>Campaign saved</b>\n${plan === "free" || plan === "starter" ? "Choose groups for delivery through IOAds." : "Select the groups that should receive this ad."}\n\n${names}`, { parse_mode: "HTML", reply_markup: menu(rows) });
   });
   bot.catch((error) => console.error(`ads bot update failed: ${String(error)}`));
   void bot.start({ onStart: () => console.log("Ads bot started") });
