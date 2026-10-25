@@ -7,7 +7,7 @@ import { tierRank } from "./services/plans.js";
 import { setGroup } from "./services/groups.js";
 import { createCampaign, addTarget, setCampaignStatus } from "./services/campaigns.js";
 import { FakeTelegramAdapter } from "./telegram.js";
-import { setAdapterForTest, loginStart, cancelLogin } from "./services/account.js";
+import { setAdapterForTest, loginStart, loginComplete, cancelLogin } from "./services/account.js";
 import { runSchedulerOnce } from "./services/scheduler.js";
 import { ownerAuth } from "./auth.js";
 import { createApiRouter } from "./api.js";
@@ -67,6 +67,14 @@ assert.deepEqual(adapter.inlineSent.at(-1), { chatId: "-100123", query: `campaig
   db.prepare("UPDATE accounts SET status = 'active', session = 'fake' WHERE tenantId = ? AND accountId = ?").run("tenant-a", nextId);
 }
  await assert.rejects(() => loginStart(db, "tenant-a", "+second", "second"), /already active/);
+const loginDb = openDb(":memory:");
+applyDesired(loginDb, { ...desired, tenantId: "tenant-login" });
+setAdapterForTest("tenant-login", "new-account", new FakeTelegramAdapter());
+assert.equal((await loginStart(loginDb, "tenant-login", "+12345678901", "new-account")).sent, true);
+assert.deepEqual(loginDb.prepare("SELECT status, phoneCodeHash FROM accounts WHERE accountId = ?").get("new-account"), { status: "connecting", phoneCodeHash: "fake-hash" });
+await loginComplete(loginDb, "tenant-login", "new-account", "+12345678901", "12345");
+assert.deepEqual(loginDb.prepare("SELECT status, phone, telegramUserId, phoneCodeHash FROM accounts WHERE accountId = ?").get("new-account"), { status: "active", phone: "+12345678901", telegramUserId: 1, phoneCodeHash: null });
+loginDb.close();
 assert.throws(() => createCampaign(db, "tenant-a", { name: "Foreign", message: "message", senderAccountId: "missing", intervalSeconds: 60 }));
 db.prepare("INSERT INTO accounts (accountId, tenantId, ownerId, status, createdAt, updatedAt) VALUES (?, ?, ?, 'connecting', ?, ?)").run("login-pending", "tenant-a", 42, new Date().toISOString(), new Date().toISOString());
 setAdapterForTest("tenant-a", "login-pending", new FakeTelegramAdapter());

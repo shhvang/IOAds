@@ -65,17 +65,17 @@ export async function loginStart(db: Database.Database, tenantId: string, phone:
   const owned = db.prepare("SELECT tenantId, status FROM accounts WHERE accountId = ?").get(accountId) as { tenantId: string; status: string } | undefined;
   if (owned && owned.tenantId !== tenantId) throw new Error("account not found");
   if (owned?.status === "active") throw new Error("account is already active");
-  const existing = db.prepare("SELECT status FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { status: string } | undefined;
    if (Number((db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE tenantId = ? AND (status = 'active' OR status = 'connecting')").get(tenantId) as { n: number }).n) >= limitFor(db, tenantId, "accounts")) throw new Error("account limit reached");
   const created = now();
-  db.prepare(`INSERT INTO accounts (accountId, tenantId, ownerId, loginPhone, createdAt, updatedAt) SELECT ?, tenantId, ownerId, ?, ?, ? FROM tenants WHERE tenantId = ?
+  db.prepare(`INSERT INTO accounts (accountId, tenantId, ownerId, status, loginPhone, createdAt, updatedAt) SELECT ?, tenantId, ownerId, 'connecting', ?, ?, ? FROM tenants WHERE tenantId = ?
      ON CONFLICT(tenantId, accountId) DO UPDATE SET loginPhone=excluded.loginPhone, phoneCodeHash=NULL, status='connecting', updatedAt=excluded.updatedAt`).run(accountId, phone, created, created, tenantId);
   console.log(`[loginStart] account record created, calling adapter.sendCode`);
   const adapter = adapterFor(db, tenantId, accountId);
   try {
     const result = await adapter.sendCode(phone);
-    console.log(`[loginStart] sendCode succeeded, phoneCodeHash=${result.phoneCodeHash}`);
-    db.prepare("UPDATE accounts SET phoneCodeHash = ?, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(result.phoneCodeHash, now(), tenantId, accountId);
+    console.log(`[loginStart] sendCode succeeded`);
+    const saved = db.prepare("UPDATE accounts SET phoneCodeHash = ?, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(result.phoneCodeHash, now(), tenantId, accountId);
+    if (!saved.changes) throw new Error("login was cancelled");
     console.log(`[loginStart] success`);
     return { accountId, sent: true };
   } catch (error) {
@@ -95,7 +95,7 @@ export async function cancelLogin(db: Database.Database, tenantId: string, accou
 }
 
 export async function loginComplete(db: Database.Database, tenantId: string, accountId: string, phone: string, code: string, password?: string): Promise<void> {
-  console.log(`[loginComplete] START - tenantId=${tenantId}, accountId=${accountId}, phone=${phone.slice(0,4)}***, code=${code.slice(0,2)}**, password=${password?'[set]':'[none]'}`);
+  console.log(`[loginComplete] START - tenantId=${tenantId}, accountId=${accountId}, password=${password?'[set]':'[none]'}`);
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before login");
   console.log(`[loginComplete] getting adapter`);
   const adapter = adapterFor(db, tenantId, accountId);

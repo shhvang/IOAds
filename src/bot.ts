@@ -32,6 +32,7 @@ function loginError(error: unknown): string {
   if (text.includes("PHONE_CODE_EXPIRED")) return "The code expired. Cancel and request a new one.";
   if (text.includes("SESSION_PASSWORD_NEEDED")) return "This account needs its 2FA password after the code.";
   if (text.includes("PASSWORD_HASH_INVALID")) return "The 2FA password is incorrect.";
+  if (text.includes("LOGIN CODE WAS NOT REQUESTED")) return "This login session expired. Cancel and request a new code.";
   if (text.includes("FLOOD_WAIT")) return "Telegram is rate limiting login attempts. Wait before trying again.";
   if (/TIMEOUT|NETWORK|CONNECTION/.test(text)) return "Telegram is taking too long to respond. Try again shortly.";
   return "Telegram could not complete this step. Try again or cancel the login.";
@@ -328,7 +329,7 @@ export function startAdsBot(db: Database.Database): void {
         const inputCode = rawInput.replace(/\s+/g, "");
         const code = flow.action === "password" ? flow.code : inputCode;
         const passwordValue = flow.action === "password" ? rawInput : undefined;
-        console.log(`[bot] User ${ctx.from.id} submitted input: rawInput="${rawInput}", stripped="${inputCode}", isValid=${/^\d{5,6}$/.test(inputCode)}, flow.action=${flow.action}, accountId=${flow.accountId}`);
+        console.log(`[bot] User ${ctx.from.id} submitted login input: flow.action=${flow.action}, accountId=${flow.accountId}`);
         if (flow.action === "code" && !/^\d{5,6}$/.test(inputCode)) {
           console.log(`[bot] Invalid code format, rejecting`);
           await ctx.reply("Send the 5 or 6 digit login code from Telegram.\n\n💡 Tip: You can send it with or without spaces (e.g., <code>12345</code> or <code>1 2 3 4 5</code>).", { parse_mode: "HTML" });
@@ -345,7 +346,7 @@ export function startAdsBot(db: Database.Database): void {
         }, 1_500);
         const action = setInterval(() => void ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => undefined), 4_000);
         try {
-          console.log(`[bot] Calling loginComplete with accountId=${flow.accountId}, phone=${flow.phone}, code=${code?.slice(0,2)}**, password=${passwordValue?'[set]':'[none]'}`);
+          console.log(`[bot] Calling loginComplete with accountId=${flow.accountId}, password=${passwordValue?'[set]':'[none]'}`);
           await ctx.api.sendChatAction(ctx.chat.id, "typing");
           await loginComplete(db, tenantId(ctx.from.id), flow.accountId!, flow.phone!, code!, passwordValue);
           clearInterval(progressTimer);
