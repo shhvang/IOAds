@@ -125,18 +125,22 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       authError = null;
       if (authPhase === "password") {
         if (!password) throw new Error("SESSION_PASSWORD_NEEDED");
+        console.log(`[${accountId}] waiting for password request...`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
         const request = authRequests.password;
+        console.log(`[${accountId}] providing password, request count=${request}`);
         provide("password", password);
         while (authRequests.password === request && !["ready", "closed"].includes(currentPhase())) await new Promise((resolve) => setTimeout(resolve, 50));
         if (authRequests.password > request) throw new Error("PASSWORD_HASH_INVALID");
       } else if (authPhase === "code") {
+        console.log(`[${accountId}] waiting briefly for TDLib callback to fire...`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
         const request = authRequests.code;
-        console.log(`[${accountId}] providing code, request=${request}`);
+        console.log(`[${accountId}] providing code, request count=${request}, authRequests.code=${authRequests.code}`);
         provide("code", code);
         console.log(`[${accountId}] waiting for phase transition from ${authPhase}`);
         while (authRequests.code === request && !["ready", "password", "closed"].includes(currentPhase())) await new Promise((resolve) => setTimeout(resolve, 50));
-        console.log(`[${accountId}] wait ended, authError=${authError ? String(authError) : 'null'}, authRequests.code=${authRequests.code}, currentPhase=${currentPhase()}`);
-        if (authError) throw authError;
+        console.log(`[${accountId}] wait ended, authRequests.code=${authRequests.code}, request=${request}, currentPhase=${currentPhase()}`);
         if (authRequests.code > request) throw new Error("PHONE_CODE_INVALID");
         if (currentPhase() === "password") throw new Error("SESSION_PASSWORD_NEEDED");
       } else throw new Error("Telegram is not waiting for a login code");
