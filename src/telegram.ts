@@ -111,13 +111,19 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
   const ready = async (): Promise<Client> => { await authReady; return td; };
   return {
     async sendCode(phone) {
+      console.log(`[${accountId}] sendCode called with phone=${phone.slice(0,4)}***`);
       await waitForPhase("phone", "closed");
+      console.log(`[${accountId}] phase is now ${authPhase}, previouslyAuthorized=${previouslyAuthorized}`);
       if (previouslyAuthorized) throw new Error("This account is already connected");
       if (authPhase !== "phone") throw new Error("Telegram is not ready for a phone number");
+      console.log(`[${accountId}] providing phone to TDLib`);
       provide("phone", phone);
+      console.log(`[${accountId}] waiting for 'code' phase...`);
       await waitForPhase("code", "closed");
+      console.log(`[${accountId}] phase is now ${authPhase}, authError=${authError?String(authError):'null'}`);
       if (authError) throw authError;
        if (currentPhase() === "closed") throw new Error("Telegram closed the login session");
+      console.log(`[${accountId}] sendCode success`);
       return { phoneCodeHash: "tdlib" };
     },
     async signIn(_phone, _hash, code, password) {
@@ -151,6 +157,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       return { session: `tdlib:${accountId}`, userId };
     },
     async dialogs() {
+      console.log(`[${accountId}] dialogs() called`);
       const current = await ready();
       const chats = await current.invoke({ _: "getChats", chat_list: { _: "chatListMain" }, limit: 200 });
       const result: TelegramDialog[] = [];

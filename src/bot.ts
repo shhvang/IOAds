@@ -328,13 +328,15 @@ export function startAdsBot(db: Database.Database): void {
         const inputCode = rawInput.replace(/\s+/g, "");
         const code = flow.action === "password" ? flow.code : inputCode;
         const passwordValue = flow.action === "password" ? rawInput : undefined;
-        console.log(`Login code received: rawInput="${rawInput}", stripped="${inputCode}", isValid=${/^\d{5,6}$/.test(inputCode)}, flow.action=${flow.action}`);
+        console.log(`[bot] User ${ctx.from.id} submitted input: rawInput="${rawInput}", stripped="${inputCode}", isValid=${/^\d{5,6}$/.test(inputCode)}, flow.action=${flow.action}, accountId=${flow.accountId}`);
         if (flow.action === "code" && !/^\d{5,6}$/.test(inputCode)) {
+          console.log(`[bot] Invalid code format, rejecting`);
           await ctx.reply("Send the 5 or 6 digit login code from Telegram.\n\n💡 Tip: You can send it with or without spaces (e.g., <code>12345</code> or <code>1 2 3 4 5</code>).", { parse_mode: "HTML" });
           return;
         }
         const verifyingFlow: Flow = { ...flow, action: "verifying_code" };
         flows.set(ctx.from.id, verifyingFlow);
+        console.log(`[bot] Starting verification, setting flow to verifying_code`);
         let frame = 0;
         const progress = await ctx.reply("Verifying your login with Telegram");
         const progressTimer = setInterval(() => {
@@ -343,22 +345,24 @@ export function startAdsBot(db: Database.Database): void {
         }, 1_500);
         const action = setInterval(() => void ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => undefined), 4_000);
         try {
-          console.log(`Calling loginComplete with accountId=${flow.accountId}, phone=${flow.phone}, code=${code}, password=${passwordValue?'[set]':'undefined'}`);
+          console.log(`[bot] Calling loginComplete with accountId=${flow.accountId}, phone=${flow.phone}, code=${code?.slice(0,2)}**, password=${passwordValue?'[set]':'[none]'}`);
           await ctx.api.sendChatAction(ctx.chat.id, "typing");
           await loginComplete(db, tenantId(ctx.from.id), flow.accountId!, flow.phone!, code!, passwordValue);
           clearInterval(progressTimer);
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           flows.delete(ctx.from.id);
-          console.log(`Login successful for user ${ctx.from.id}`);
+          console.log(`[bot] Login successful for user ${ctx.from.id}`);
           await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "<b>Userbot connected</b>\nYou can now sync its groups and create a campaign.", { parse_mode: "HTML", reply_markup: home() });
         } catch (error) {
-          console.log(`Login failed for user ${ctx.from.id}:`, error);
+          console.log(`[bot] Login failed for user ${ctx.from.id}:`, error);
           clearInterval(progressTimer);
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           if (String(error).toUpperCase().includes("SESSION_PASSWORD_NEEDED") && flow.action === "code") {
+            console.log(`[bot] 2FA required, prompting for password`);
             flows.set(ctx.from.id, { ...flow, action: "password", code: code! });
              await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "🔐 <b>Two-step verification required</b>\n\nThis account has 2FA enabled. Send your cloud password (the one you set in Security settings, not the login code) to complete the connection.", { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
           } else {
+            console.log(`[bot] Showing error to user: ${loginError(error)}`);
             flows.set(ctx.from.id, { ...flow, action: flow.action === "password" ? "password" : "code", code: flow.action === "password" ? flow.code : code });
              await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `❌ <b>Login failed</b>\n\n${loginError(error)}\n\nTry again or cancel to start over.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
           }
