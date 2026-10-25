@@ -84,10 +84,11 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
     databaseEncryptionKey: config.sessionEncryptionKey,
   });
   client = td;
-  td.on("error", (error) => { authError = error; authReadyReject(error); });
+  td.on("error", (error) => { console.log(`[${accountId}] TDLib error:`, error); authError = error; authReadyReject(error); });
   td.on("update", (update) => {
     if (update._ === "updateAuthorizationState") {
       const state = update.authorization_state;
+      console.log(`[${accountId}] auth state: ${state._}`);
       if (state._ === "authorizationStateWaitPhoneNumber") setPhase("phone");
       if (state._ === "authorizationStateWaitCode") setPhase("code");
       if (state._ === "authorizationStateWaitPassword") setPhase("password");
@@ -120,6 +121,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       return { phoneCodeHash: "tdlib" };
     },
     async signIn(_phone, _hash, code, password) {
+      console.log(`[${accountId}] signIn called, authPhase=${authPhase}, code=${code?.slice(0,2)}**, password=${password?'[set]':'[none]'}`);
       authError = null;
       if (authPhase === "password") {
         if (!password) throw new Error("SESSION_PASSWORD_NEEDED");
@@ -129,14 +131,19 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
         if (authRequests.password > request) throw new Error("PASSWORD_HASH_INVALID");
       } else if (authPhase === "code") {
         const request = authRequests.code;
+        console.log(`[${accountId}] providing code, request=${request}`);
         provide("code", code);
+        console.log(`[${accountId}] waiting for phase transition from ${authPhase}`);
         while (authRequests.code === request && !["ready", "password", "closed"].includes(currentPhase())) await new Promise((resolve) => setTimeout(resolve, 50));
+        console.log(`[${accountId}] wait ended, authError=${authError ? String(authError) : 'null'}, authRequests.code=${authRequests.code}, currentPhase=${currentPhase()}`);
         if (authError) throw authError;
         if (authRequests.code > request) throw new Error("PHONE_CODE_INVALID");
         if (currentPhase() === "password") throw new Error("SESSION_PASSWORD_NEEDED");
       } else throw new Error("Telegram is not waiting for a login code");
       if (currentPhase() === "closed") throw new Error("Telegram closed the login session");
+      console.log(`[${accountId}] waiting for ready...`);
       await ready();
+      console.log(`[${accountId}] signIn success, userId=${userId}`);
       return { session: `tdlib:${accountId}`, userId };
     },
     async dialogs() {
