@@ -120,6 +120,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       return { phoneCodeHash: "tdlib" };
     },
     async signIn(_phone, _hash, code, password) {
+      authError = null;
       if (authPhase === "password") {
         if (!password) throw new Error("SESSION_PASSWORD_NEEDED");
         const request = authRequests.password;

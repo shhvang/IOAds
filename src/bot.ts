@@ -156,7 +156,7 @@ export function startAdsBot(db: Database.Database): void {
       return;
     }
     flows.set(ctx.from.id, { action: "phone" });
-    await ctx.reply(`👥 <b>Connect an account</b>\nEnter the phone number with its country code. Telegram will send a sign-in code to your account, either in Telegram or by SMS. Your encrypted account database stays on this service.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
+    await ctx.reply(`👥 <b>Connect an account</b>\n\n<b>Step 1:</b> Send the phone number with country code (e.g., <code>+1234567890</code>)\n<b>Step 2:</b> Telegram will send a login code\n<b>Step 3:</b> Send the code here\n<b>Step 4:</b> If 2FA is enabled, send the password\n\n⚠️ <b>Important:</b> If you're connecting <i>this account</i> (the one using this bot), send the code with spaces: <code>1 2 3 4 5</code> to prevent auto-fill.\n\nYour session is encrypted and stays on this service.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
   });
   bot.callbackQuery("login:cancel", async (ctx) => {
     const flow = flows.get(ctx.from.id);
@@ -318,17 +318,18 @@ export function startAdsBot(db: Database.Database): void {
           }
           flows.set(ctx.from.id, { action: "code", accountId: result.accountId, phone });
           clearInterval(progressTimer);
-           await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "Code requested. Check the account’s Telegram app or SMS, then send the code here. If Telegram asks for your 2FA password, send that in the next message.", { reply_markup: menu([[button("Cancel", "login:cancel")]]) });
+           await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `✅ <b>Code sent</b>\n\nTelegram sent a login code to <code>${escapeHtml(phone)}</code>. Check the account's Telegram app or SMS.\n\n⚠️ <b>If this is your current account:</b> Send the code with spaces between digits (e.g., <code>1 2 3 4 5</code>) to prevent auto-fill.\n\n<b>Otherwise:</b> Send the code normally (e.g., <code>12345</code>).`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
         } finally {
           clearInterval(progressTimer);
           clearInterval(action);
         }
       } else if (flow.action === "code" || flow.action === "password") {
-        const [inputCode, password] = ctx.message.text.split(" ", 2);
+        const rawInput = ctx.message.text.trim();
+        const inputCode = rawInput.replace(/\s+/g, "");
         const code = flow.action === "password" ? flow.code : inputCode;
-        const passwordValue = flow.action === "password" ? ctx.message.text : password;
-        if (flow.action === "code" && !/^\d{5,6}$/.test(inputCode ?? "")) {
-          await ctx.reply("Send the login code from Telegram. If your account uses 2FA, add its password after the code.");
+        const passwordValue = flow.action === "password" ? rawInput : undefined;
+        if (flow.action === "code" && !/^\d{5,6}$/.test(inputCode)) {
+          await ctx.reply("Send the 5 or 6 digit login code from Telegram.\n\n💡 Tip: You can send it with or without spaces (e.g., <code>12345</code> or <code>1 2 3 4 5</code>).", { parse_mode: "HTML" });
           return;
         }
         const verifyingFlow: Flow = { ...flow, action: "verifying_code" };
@@ -352,10 +353,10 @@ export function startAdsBot(db: Database.Database): void {
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           if (String(error).toUpperCase().includes("SESSION_PASSWORD_NEEDED") && flow.action === "code") {
             flows.set(ctx.from.id, { ...flow, action: "password", code: code! });
-             await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "Two-step verification is enabled. Send the account password to finish connecting.", { reply_markup: menu([[button("Cancel", "login:cancel")]]) });
+             await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "🔐 <b>Two-step verification required</b>\n\nThis account has 2FA enabled. Send your cloud password (the one you set in Security settings, not the login code) to complete the connection.", { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
           } else {
             flows.set(ctx.from.id, { ...flow, action: flow.action === "password" ? "password" : "code", code: flow.action === "password" ? flow.code : code });
-             await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `Could not verify this login: ${loginError(error)}\nTry again or cancel the login.`, { reply_markup: menu([[button("Cancel", "login:cancel")]]) });
+             await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `❌ <b>Login failed</b>\n\n${loginError(error)}\n\nTry again or cancel to start over.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
           }
         } finally {
           clearInterval(progressTimer);
