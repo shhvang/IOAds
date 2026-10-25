@@ -328,6 +328,7 @@ export function startAdsBot(db: Database.Database): void {
         const inputCode = rawInput.replace(/\s+/g, "");
         const code = flow.action === "password" ? flow.code : inputCode;
         const passwordValue = flow.action === "password" ? rawInput : undefined;
+        console.log(`Login code received: rawInput="${rawInput}", stripped="${inputCode}", isValid=${/^\d{5,6}$/.test(inputCode)}, flow.action=${flow.action}`);
         if (flow.action === "code" && !/^\d{5,6}$/.test(inputCode)) {
           await ctx.reply("Send the 5 or 6 digit login code from Telegram.\n\n💡 Tip: You can send it with or without spaces (e.g., <code>12345</code> or <code>1 2 3 4 5</code>).", { parse_mode: "HTML" });
           return;
@@ -342,13 +343,16 @@ export function startAdsBot(db: Database.Database): void {
         }, 1_500);
         const action = setInterval(() => void ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => undefined), 4_000);
         try {
+          console.log(`Calling loginComplete with accountId=${flow.accountId}, phone=${flow.phone}, code=${code}, password=${passwordValue?'[set]':'undefined'}`);
           await ctx.api.sendChatAction(ctx.chat.id, "typing");
           await loginComplete(db, tenantId(ctx.from.id), flow.accountId!, flow.phone!, code!, passwordValue);
           clearInterval(progressTimer);
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           flows.delete(ctx.from.id);
+          console.log(`Login successful for user ${ctx.from.id}`);
           await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "<b>Userbot connected</b>\nYou can now sync its groups and create a campaign.", { parse_mode: "HTML", reply_markup: home() });
         } catch (error) {
+          console.log(`Login failed for user ${ctx.from.id}:`, error);
           clearInterval(progressTimer);
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           if (String(error).toUpperCase().includes("SESSION_PASSWORD_NEEDED") && flow.action === "code") {
