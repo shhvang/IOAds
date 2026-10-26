@@ -6,37 +6,11 @@ type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
 type CachedMediaWithoutId = WithoutId<CachedMedia>;
 type InlineRichMessage = Extract<Extract<InlineQueryResult, { type: "article" }>["input_message_content"], { rich_message: unknown }>["rich_message"];
 export type InlineCampaign = { id: number; name: string; message: string; messageEntities: string; richMessage: string | null; richContent: string | null; inlineOptions: string | null; contentKind: string };
-export const IOADS_LOGO_EMOJI_ID = "6269269392949782410";
-const logo = { type: "custom_emoji" as const, custom_emoji_id: IOADS_LOGO_EMOJI_ID, alternative_text: "📣" };
-
 function attributionBlock(botUsername: string) {
   return { type: "buttons" as const, align: "right" as const, buttons: [{
-    text: [logo, " posted by IOAds"],
+    text: "posted by IOAds",
     url: `https://t.me/${botUsername.replace(/^@/, "")}?start=posted`,
   }] };
-}
-
-/** Telegram may reject custom emoji in inline results if the bot lacks a Fragment username. */
-export function withoutAttributionEmoji(results: InlineQueryResult[]): InlineQueryResult[] {
-  return results.map((result) => {
-    if (result.type !== "article" || !("rich_message" in result.input_message_content)) return result;
-    const rich = result.input_message_content.rich_message;
-    if (rich.html) {
-      const icon = `<tg-emoji emoji-id="${IOADS_LOGO_EMOJI_ID}">📣</tg-emoji> `;
-      const position = rich.html.lastIndexOf(icon);
-      if (position < 0) return result;
-      return { ...result, input_message_content: { rich_message: {
-        ...rich, html: rich.html.slice(0, position) + rich.html.slice(position + icon.length),
-      } } };
-    }
-    if (!rich.blocks?.length) return result;
-    const blocks = [...rich.blocks];
-    const last = blocks.at(-1);
-    if (last?.type !== "buttons" || !last.buttons.some((button) => "url" in button && button.url?.includes("?start=posted"))) return result;
-    blocks[blocks.length - 1] = { ...last, buttons: last.buttons.map((button) => "url" in button && button.url?.includes("?start=posted")
-      ? { ...button, text: "posted by IOAds" } : button) };
-    return { ...result, input_message_content: { rich_message: { ...rich, blocks } } };
-  });
 }
 
 function escapeHtml(value: string): string {
@@ -128,7 +102,7 @@ function richTextFromEntities(text: string, entities: MessageEntity[]): RichText
 
 function attributionHtml(botUsername: string): string {
   const url = escapeHtml(`https://t.me/${botUsername.replace(/^@/, "")}?start=posted`);
-  return `<tg-button-row align="right"><tg-button type="url" url="${url}"><tg-emoji emoji-id="${IOADS_LOGO_EMOJI_ID}">📣</tg-emoji> posted by IOAds</tg-button></tg-button-row>`;
+  return `<tg-button-row align="right"><tg-button type="url" url="${url}">posted by IOAds</tg-button></tg-button-row>`;
 }
 
 // Received rich blocks contain output media objects; inline results require input media objects.
@@ -226,7 +200,7 @@ export function featureInlineResult(botUsername: string): InlineQueryResult {
   const url = escapeHtml(`https://t.me/${botUsername.replace(/^@/, "")}?start=inline`);
   return { type: "article", id: "ioads-features", title: "IOAds · scheduled Telegram posts",
     description: "Connect accounts, choose groups, and schedule posts. Open the bot to get started.",
-    input_message_content: { rich_message: { html: `<p>IOAds schedules posts to groups your connected Telegram accounts already belong to. Choose the groups and timing in the bot.</p><tg-button-row align="right"><tg-button type="url" url="${url}"><tg-emoji emoji-id="${IOADS_LOGO_EMOJI_ID}">📣</tg-emoji> Open IOAds</tg-button></tg-button-row>` } } };
+    input_message_content: { rich_message: { html: `<p>IOAds schedules posts to groups your connected Telegram accounts already belong to. Choose the groups and timing in the bot.</p><tg-button-row align="right"><tg-button type="url" url="${url}">Open IOAds</tg-button></tg-button-row>` } } };
 }
 
 export function inlineResults(db: Database.Database, userId: number, query: string, botUsername: string): InlineQueryResult[] {

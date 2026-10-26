@@ -32,14 +32,14 @@ captions, and the original inline keyboard. Empty or ordinary inline queries
 show one IOAds feature result with a rich-message button to open the bot in
 private chat; campaign content is returned only for an explicit authorized
 campaign query. Supported campaign posts add one small rich-message button
-inside the post, labeled "posted by IOAds" with the IOAds logo custom emoji.
+inside the post, labeled "posted by IOAds" without a custom emoji.
 The button opens the bot's private chat; any original buttons remain intact.
 Link-preview options, stickers, and captions displayed above media retain their
 original inline result format because rich messages cannot represent all their
 settings. Direct copies cannot carry the rich-message button. Telegram restricts
 custom emoji in inline results to bots with an additional username purchased
-on Fragment. If Telegram rejects the IOAds logo, the bot retries with the same
-rich-message button without its logo; campaign custom emoji are never removed.
+on Fragment. The bot does not add an emoji to its attribution and never removes
+custom emoji from the campaign itself.
 The bot reports failed deliveries if Telegram rejects them; it does not replace
 the post with altered text.
 
