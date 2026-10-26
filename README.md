@@ -25,9 +25,10 @@ IOAds runs independently when `RENTAL_HUB_URL` and `RENTAL_SECRET` are unset.
 Set both only when connecting it to the rental hub; standalone bot users and
 hub-provisioned tenants remain separate.
 
-With `ADS_BOT_USERNAME` configured and inline mode enabled in BotFather, new
-text, supported media, and rich-message campaigns use one private inline result
-per campaign. The inline payload retains its entities, rich blocks, cached media,
+With `ADS_BOT_USERNAME` configured and inline mode enabled in BotFather, Free
+campaigns use one private inline result per campaign. Paid campaigns use direct
+posts from the connected account; the posting method is set by the plan.
+The inline payload retains its entities, rich blocks, cached media,
 captions, and the original inline keyboard. Empty or ordinary inline queries
 show one IOAds feature result with a rich-message button to open the bot in
 private chat; campaign content is returned only for an explicit authorized
@@ -39,23 +40,28 @@ original inline result format because rich messages cannot represent all their
 settings. Direct copies cannot carry the rich-message button. Telegram restricts
 custom emoji in inline results to bots with an additional username purchased
 on Fragment. The bot does not add an emoji to its attribution and never removes
-custom emoji from the campaign itself.
+custom emoji from the campaign itself. Paid direct posting of custom emoji
+requires a Premium connected account; Telegram rejects those sends otherwise.
 The bot reports failed deliveries if Telegram rejects them; it does not replace
 the post with altered text.
 
 Set `ADS_ARCHIVE_CHAT` to a private chat accessible to the connected accounts
-when direct copies or media features unsupported by inline mode are needed.
+when paid campaigns use media, rich posts, or original buttons and previews.
 The bot archives incoming posts there and connected accounts copy from it.
 Albums are refused because Telegram delivers their items separately. The
 archive must be separate from every campaign target. Without an archive,
-posts that cannot be sent intact through inline mode are refused at creation.
+Free posts that cannot be sent inline are refused at creation. Paid posts that
+need a direct archive copy are refused until `ADS_ARCHIVE_CHAT` is configured.
 The standalone plans allow 2,000 daily messages on Free, 5,000 on Pro ($1),
-and 15,000 on Business ($3), with 1, 5, and 15 connected account slots. A
+and 15,000 on Business ($3), with 1, 5, and 15 connected account slots and
+1, 5, and 20 campaign slots respectively. A
 connected sender must be a different Telegram account from the one operating
 the bot. Existing matching sessions are disconnected when the service starts.
 
-Campaigns stay as drafts until at least one group is selected and Schedule is
-pressed. The bot shows this action after group selection. Group lists are read
+Campaigns stay as drafts while the owner sends the post, chooses accounts and
+groups, sets the timer, and reviews the campaign before pressing Start. Existing
+campaign posts can be replaced without changing their targets or timer. Group
+lists are read
 from the local cache during setup; Refresh groups performs a full Telegram
 sync only when requested. Activity shows delivery failures and retry times.
 

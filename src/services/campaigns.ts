@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { adapterFor, requireAccount } from "./account.js";
 import { writeAudit } from "./audit.js";
 import { limitFor } from "./limits.js";
+import { standalonePostingIssue } from "./plans.js";
 
 const text = (value: unknown, field: string, max: number): string => {
   if (typeof value !== "string" || !value.trim() || value.length > max) throw new Error(`${field} must be 1-${max} characters`);
@@ -41,11 +42,48 @@ export function updateCampaign(db: Database.Database, tenantId: string, id: numb
   writeAudit(db, tenantId, "campaign_updated", { id });
   return campaign(db, tenantId, id);
 }
+export type CampaignPost = {
+  name: string;
+  message: string;
+  messageEntities: string;
+  sourceChatId: string | null;
+  sourceMessageId: number | null;
+  richMessage: string | null;
+  richContent: string | null;
+  inlineOptions: string;
+  contentKind: "text" | "media" | "rich";
+  inlineMode: number;
+};
+
+/** Replace every saved representation of a post together while retaining its schedule and targets. */
+export function saveCampaignPost(db: Database.Database, tenantId: string, post: CampaignPost, accountId: string, campaignId?: number): number {
+  return db.transaction(() => {
+    let id: number;
+    if (campaignId !== undefined) {
+      const existing = campaign(db, tenantId, campaignId);
+      if (!existing) throw new Error("campaign not found");
+      id = campaignId;
+    } else {
+      id = (createCampaign(db, tenantId, { name: post.name, message: post.message, senderAccountId: accountId, intervalSeconds: 300 }) as { id: number }).id;
+    }
+    const name = text(post.name, "name", 120);
+    const message = text(post.message, "message", 4096);
+    db.prepare(`UPDATE campaigns SET name=?,message=?,messageEntities=?,sourceChatId=?,sourceMessageId=?,richMessage=?,richContent=?,inlineOptions=?,contentKind=?,inlineMode=?,updatedAt=? WHERE tenantId=? AND id=?`)
+      .run(name, message, post.messageEntities, post.sourceChatId, post.sourceMessageId, post.richMessage, post.richContent, post.inlineOptions, post.contentKind, post.inlineMode, now(), tenantId, id);
+    if (campaignId !== undefined) writeAudit(db, tenantId, "campaign_content_updated", { id });
+    return id;
+  })();
+}
 export function deleteCampaign(db: Database.Database, tenantId: string, id: number): void { db.prepare("DELETE FROM campaigns WHERE tenantId = ? AND id = ?").run(tenantId, id); writeAudit(db, tenantId, "campaign_deleted", { id }); }
 export function setCampaignStatus(db: Database.Database, tenantId: string, id: number, status: "scheduled" | "paused" | "cancelled"): void {
-  const current = campaign(db, tenantId, id) as { senderAccountId: string; status: string } | undefined;
+  const current = campaign(db, tenantId, id) as { senderAccountId: string; status: string; message: string; contentKind: string; richContent: string | null; richMessage: string | null; sourceChatId: string | null; sourceMessageId: number | null; inlineOptions: string | null } | undefined;
   if (!current) throw new Error("campaign not found");
   if (status === "scheduled") {
+    const tenant = db.prepare("SELECT productId,tierCode FROM tenants WHERE tenantId=?").get(tenantId) as { productId: string; tierCode: string };
+    if (tenant.productId === "ads-standalone") {
+      const issue = standalonePostingIssue(tenant.tierCode, current, config.botUsername);
+      if (issue) throw new Error(issue);
+    }
     if (current.status === "cancelled" && Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId=? AND id!=? AND status!='cancelled'").get(tenantId, id) as { n: number }).n) >= limitFor(db, tenantId, "campaigns")) throw new Error("campaign limit reached");
     const target = db.prepare(`SELECT 1 FROM campaignTargets ct JOIN groups g
       ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId

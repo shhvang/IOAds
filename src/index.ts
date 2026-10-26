@@ -17,6 +17,7 @@ import { tierLimits } from "./services/plans.js";
 
 validateConfig();
 const db = openDb(`${config.dataDir}/ads.db`);
+for (const row of db.prepare("SELECT tenantId FROM localUsers").all() as Array<{ tenantId: string }>) enforceTenantLimits(db, row.tenantId);
 if (config.telegramApiId && config.telegramApiHash && config.sessionEncryptionKey) startWorkerPool();
 const app = express();
 app.get("/health", (_req, res) => res.json({ ok: true, service: "ads" }));

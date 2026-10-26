@@ -3,13 +3,14 @@ import { config } from "../config.js";
 import { now } from "../db.js";
 import { adapterFor } from "./account.js";
 import type { TelegramAdapter } from "../telegram.js";
-import { tierRank } from "./plans.js";
+import { standalonePostingIssue, tierRank } from "./plans.js";
 import { tenantLimits } from "./limits.js";
 
 const LEASE_MS = 120_000;
 type Delivery = { id: number; tenantId: string; campaignId: number; accountId: string; chatId: string; attempts: number;
   message: string; messageEntities: string; messageOverride: string | null; sourceChatId: string | null;
-  sourceMessageId: number | null; inlineMode: number; contentKind: string; tierCode: string; groupCooldownSeconds: number;
+  sourceMessageId: number | null; inlineMode: number; contentKind: string; richContent: string | null; richMessage: string | null;
+  inlineOptions: string | null; tierCode: string; productId: string; groupCooldownSeconds: number;
   accountCooldownSeconds: number; lastSentAt: string | null };
 
 const nextDay = (): string => {
@@ -53,7 +54,7 @@ function claimDelivery(db: Database.Database): Delivery | "deferred" | null {
       return "deferred";
     }
     db.prepare("UPDATE deliveries SET status='claimed',attempts=attempts+1,claimedAt=?,error=NULL WHERE id=?").run(time, candidate.id);
-    return db.prepare("SELECT d.id,d.tenantId,d.campaignId,d.accountId,d.chatId,d.attempts,c.message,c.messageEntities,c.sourceChatId,c.sourceMessageId,c.inlineMode,c.contentKind,c.groupCooldownSeconds,c.accountCooldownSeconds,g.messageOverride,g.lastSentAt,t.tierCode FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN tenants t ON t.tenantId=d.tenantId WHERE d.id=?")
+    return db.prepare("SELECT d.id,d.tenantId,d.campaignId,d.accountId,d.chatId,d.attempts,c.message,c.messageEntities,c.sourceChatId,c.sourceMessageId,c.inlineMode,c.contentKind,c.richContent,c.richMessage,c.inlineOptions,c.groupCooldownSeconds,c.accountCooldownSeconds,g.messageOverride,g.lastSentAt,t.tierCode,t.productId FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN tenants t ON t.tenantId=d.tenantId WHERE d.id=?")
       .get(candidate.id) as Delivery;
   })();
 }
@@ -78,8 +79,15 @@ async function deliver(db: Database.Database, d: Delivery, getAdapter: (tenantId
     const message = tierRank(d.tierCode) >= 1 && d.messageOverride ? d.messageOverride : d.message;
     const entities = JSON.parse(d.messageEntities || "[]") as Array<Record<string, unknown>>;
     const hasCustomEmoji = entities.some((entity) => entity.type === "custom_emoji");
+    if (d.productId === "ads-standalone" && !(d.messageOverride && tierRank(d.tierCode) >= 1)) {
+      const issue = standalonePostingIssue(d.tierCode, d, config.botUsername);
+      if (issue) throw new Error(issue);
+    }
     if (d.messageOverride && tierRank(d.tierCode) >= 1) await getAdapter(d.tenantId, d.accountId).sendMessage(d.chatId, message, []);
-    else if (d.inlineMode && config.botUsername) await getAdapter(d.tenantId, d.accountId).sendInline(d.chatId, `campaign:${d.campaignId}`);
+    else if (d.productId === "ads-standalone" ? tierRank(d.tierCode) === 0 : !!d.inlineMode) {
+      if (!config.botUsername) throw new Error("Inline delivery needs ADS_BOT_USERNAME.");
+      await getAdapter(d.tenantId, d.accountId).sendInline(d.chatId, `campaign:${d.campaignId}`);
+    }
     else if (d.sourceChatId && d.sourceMessageId) await getAdapter(d.tenantId, d.accountId).copyMessage(d.chatId, d.sourceChatId, d.sourceMessageId, hasCustomEmoji);
     else if (d.contentKind === "text" || (d.contentKind === "legacy" && d.message !== "[Telegram media or rich message]")) await getAdapter(d.tenantId, d.accountId).sendMessage(d.chatId, message, entities);
     else throw new Error("Campaign content has no reusable inline result or archive copy");

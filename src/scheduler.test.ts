@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { openDb, now } from "./db.js";
 import { config } from "./config.js";
 import { FakeTelegramAdapter } from "./telegram.js";
-import { addTarget as addCampaignTarget, createCampaign, setCampaignStatus } from "./services/campaigns.js";
+import { addTarget as addCampaignTarget, createCampaign, saveCampaignPost, setCampaignStatus } from "./services/campaigns.js";
 import { runSchedulerOnce } from "./services/scheduler.js";
+import { tierLimits } from "./services/plans.js";
+import { enforceTenantLimits } from "./services/limits.js";
 
 config.deliveryConcurrency = 16;
 const db = openDb(":memory:");
@@ -72,4 +74,45 @@ assert.equal(primaryAdapter.sent.length, 2);
 assert.equal(secondaryAdapter.sent.length, 1);
 assert.equal((db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE campaignId=? AND status='failed'").get(shared.id) as { n: number }).n, 3);
 db.close();
+// Standalone posting follows the current plan even when a saved campaign has an older mode.
+const planDb = openDb(":memory:");
+const previousBotUsername = config.botUsername;
+config.botUsername = "ioads_test_bot";
+planDb.prepare("INSERT INTO tenants (tenantId,productId,ownerId,state,tierCode,runtime,version,trial,limits,config,updatedAt,appliedAt) VALUES ('ads:42','ads-standalone',42,'active','free','service',1,0,?,'{}',?,?)")
+  .run(JSON.stringify(tierLimits("free")), time, time);
+planDb.prepare("INSERT INTO localUsers (telegramId,tenantId,tierCode,forceJoined,createdAt,updatedAt) VALUES (42,'ads:42','free',1,?,?)").run(time, time);
+planDb.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,telegramUserId,session,status,createdAt,updatedAt) VALUES ('plan-sender','ads:42',42,43,'fake','active',?,?)").run(time, time);
+planDb.prepare("INSERT INTO groups (tenantId,accountId,chatId,title,enabled,chatKind,createdAt,updatedAt) VALUES ('ads:42','plan-sender','-4242','Plan group',1,'group',?,?)").run(time, time);
+const planCampaign = createCampaign(planDb, "ads:42", { name: "Plan mode", message: "The post", senderAccountId: "plan-sender", intervalSeconds: 300 }) as { id: number };
+await addCampaignTarget(planDb, "ads:42", planCampaign.id, "-4242");
+setCampaignStatus(planDb, "ads:42", planCampaign.id, "scheduled");
+const planAdapter = new FakeTelegramAdapter();
+assert.equal(await runSchedulerOnce(planDb, () => planAdapter), 1);
+assert.deepEqual(planAdapter.inlineSent, [{ chatId: "-4242", query: `campaign:${planCampaign.id}` }]);
+planDb.prepare("UPDATE tenants SET tierCode='pro',limits=? WHERE tenantId='ads:42'").run(JSON.stringify(tierLimits("pro")));
+planDb.prepare("UPDATE localUsers SET tierCode='pro' WHERE tenantId='ads:42'").run();
+planDb.prepare("UPDATE campaigns SET inlineMode=1,nextRunAt='2000-01-01T00:00:00.000Z' WHERE id=?").run(planCampaign.id);
+assert.equal(await runSchedulerOnce(planDb, () => planAdapter), 1);
+assert.deepEqual(planAdapter.sent, [{ chatId: "-4242", message: "The post" }]);
+assert.equal(planAdapter.inlineSent.length, 1);
+saveCampaignPost(planDb, "ads:42", {
+  name: "Updated post", message: "Updated post", messageEntities: "[]", sourceChatId: null, sourceMessageId: null,
+  richMessage: null, richContent: null, inlineOptions: "{}", contentKind: "text", inlineMode: 0,
+}, "plan-sender", planCampaign.id);
+planDb.prepare("UPDATE campaigns SET nextRunAt='2000-01-02T00:00:00.000Z' WHERE id=?").run(planCampaign.id);
+assert.equal(await runSchedulerOnce(planDb, () => planAdapter), 1);
+assert.equal(planAdapter.sent.at(-1)?.message, "Updated post");
+planDb.prepare("UPDATE tenants SET tierCode='free',limits=? WHERE tenantId='ads:42'").run(JSON.stringify(tierLimits("free")));
+planDb.prepare("UPDATE localUsers SET tierCode='free' WHERE tenantId='ads:42'").run();
+planDb.prepare("UPDATE campaigns SET inlineMode=0,nextRunAt='2000-01-03T00:00:00.000Z' WHERE id=?").run(planCampaign.id);
+assert.equal(await runSchedulerOnce(planDb, () => planAdapter), 1);
+assert.equal(planAdapter.inlineSent.length, 2);
+planDb.prepare("UPDATE tenants SET tierCode='pro',limits=? WHERE tenantId='ads:42'").run(JSON.stringify(tierLimits("pro")));
+planDb.prepare("UPDATE localUsers SET tierCode='pro' WHERE tenantId='ads:42'").run();
+planDb.prepare("UPDATE campaigns SET contentKind='rich',richContent='{}',sourceChatId=NULL,sourceMessageId=NULL,status='scheduled' WHERE id=?").run(planCampaign.id);
+enforceTenantLimits(planDb, "ads:42");
+assert.equal((planDb.prepare("SELECT status FROM campaigns WHERE id=?").get(planCampaign.id) as { status: string }).status, "paused");
+assert.throws(() => setCampaignStatus(planDb, "ads:42", planCampaign.id, "scheduled"), /archive copy/);
+config.botUsername = previousBotUsername;
+planDb.close();
 console.log("scheduler: complete fanout, cooldown, and retry pass");

@@ -8,7 +8,7 @@ import { config } from "./config.js";
 import { applyDesired, getTenant } from "./rental/store.js";
 import { tierRank } from "./services/plans.js";
 import { setGroup, syncGroups } from "./services/groups.js";
-import { createCampaign, addTarget, clearTargets, selectAllTargets, setCampaignStatus } from "./services/campaigns.js";
+import { createCampaign, addTarget, clearTargets, saveCampaignPost, selectAllTargets, setCampaignStatus } from "./services/campaigns.js";
 import { FakeTelegramAdapter } from "./telegram.js";
 import { setAdapterForTest, loginStart, loginComplete, cancelLogin, deleteAccount, canRestoreAccount, restoreAccount, logout } from "./services/account.js";
 import { runSchedulerOnce } from "./services/scheduler.js";
@@ -17,7 +17,8 @@ import { createApiRouter } from "./api.js";
 import { bearerToken, secretMatches } from "./rental/contract.js";
 import { storeControlBotToken } from "./rental/secrets.js";
 import { rawAmount } from "./payments.js";
-import { tierLimits } from "./services/plans.js";
+import { standalonePostingIssue, tierLimits } from "./services/plans.js";
+import { parseLimits } from "./services/limits.js";
 import { button, editRich, richHtml } from "./bot-ui.js";
 import { cachedInlineMedia } from "./bot.js";
 import { inlineResults, reusableRichMessage, textWithEntitiesHtml } from "./inline.js";
@@ -44,6 +45,13 @@ assert.equal(rawAmount("999999", 6), 0.99);
 assert.equal(Number.isNaN(rawAmount("not-a-number", 6)), true);
 assert.deepEqual(["free", "pro", "business"].map((tier) => tierLimits(tier).dailyMessages), [2000, 5000, 15000]);
 assert.deepEqual(["free", "pro", "business"].map((tier) => tierLimits(tier).accounts), [1, 5, 15]);
+assert.deepEqual(["free", "pro", "business"].map((tier) => tierLimits(tier).campaigns), [1, 5, 20]);
+assert.equal(parseLimits({ ...tierLimits("pro"), campaigns: 100 }, "pro", true), null);
+assert.equal(parseLimits({ ...tierLimits("pro"), campaigns: 100 }, "pro")?.campaigns, 100);
+const richWithoutArchive = { message: "[Telegram rich message]", contentKind: "rich", richContent: "{}", richMessage: null, sourceChatId: null, sourceMessageId: null, inlineOptions: "{}" };
+assert.equal(standalonePostingIssue("free", richWithoutArchive, "ioads_test_bot"), null);
+assert.match(standalonePostingIssue("pro", richWithoutArchive, "ioads_test_bot") ?? "", /archive copy/);
+assert.match(standalonePostingIssue("free", { ...richWithoutArchive, inlineOptions: '{"has_media_spoiler":true}' }, "ioads_test_bot") ?? "", /cannot be sent inline/);
 assert.match(getTdlibInfo().version, /^1\.8\./);
 const desired = { tenantId: "tenant-a", productId: "ads", ownerTelegramId: 42, state: "active", tierCode: "starter", runtime: "service", version: 1, trial: false, suspendReason: null, periodEnd: null, retainUntil: null, limits: {}, secretsFingerprint: null, expectData: false, config: {}, updatedAt: new Date().toISOString() } as const;
 config.sessionEncryptionKey = "test-session-key";
@@ -301,6 +309,26 @@ await addTarget(db, "tenant-a", Number((downgraded as { id: number }).id), "-100
 setCampaignStatus(db, "tenant-a", Number((downgraded as { id: number }).id), "scheduled");
 await runSchedulerOnce(db, () => adapter);
 assert.equal(adapter.sent.at(-1)?.message, "default after downgrade");
+const editedId = Number((downgraded as { id: number }).id);
+const beforeEdit = db.prepare("SELECT status,intervalSeconds,nextRunAt FROM campaigns WHERE id=?").get(editedId);
+const beforeTargets = db.prepare("SELECT accountId,chatId,enabled FROM campaignTargets WHERE campaignId=?").all(editedId);
+const updatedEntities = JSON.stringify([{ type: "custom_emoji", offset: 0, length: 2, custom_emoji_id: "123" }]);
+const updatedMarkup = JSON.stringify({ reply_markup: { inline_keyboard: [[{ text: "More", url: "https://example.com" }]] } });
+assert.equal(saveCampaignPost(db, "tenant-a", {
+  name: "⭐️ Edited", message: "⭐️ Edited post", messageEntities: updatedEntities,
+  sourceChatId: "-100archive", sourceMessageId: 17, richMessage: null, richContent: null,
+  inlineOptions: updatedMarkup, contentKind: "text", inlineMode: 1,
+}, accountId, editedId), editedId);
+assert.deepEqual(db.prepare("SELECT status,intervalSeconds,nextRunAt FROM campaigns WHERE id=?").get(editedId), beforeEdit);
+assert.deepEqual(db.prepare("SELECT accountId,chatId,enabled FROM campaignTargets WHERE campaignId=?").all(editedId), beforeTargets);
+assert.deepEqual(db.prepare("SELECT name,message,messageEntities,sourceChatId,sourceMessageId,richMessage,richContent,inlineOptions,contentKind,inlineMode FROM campaigns WHERE id=?").get(editedId), {
+  name: "⭐️ Edited", message: "⭐️ Edited post", messageEntities: updatedEntities, sourceChatId: "-100archive",
+  sourceMessageId: 17, richMessage: null, richContent: null, inlineOptions: updatedMarkup, contentKind: "text", inlineMode: 1,
+});
+assert.throws(() => saveCampaignPost(db, "wrong-tenant", {
+  name: "Bad", message: "Bad", messageEntities: "[]", sourceChatId: null, sourceMessageId: null,
+  richMessage: null, richContent: null, inlineOptions: "{}", contentKind: "text", inlineMode: 0,
+}, accountId, editedId), /campaign not found/);
   assert.throws(() => createCampaign(db, "tenant-a", { name: "Third", message: "message", senderAccountId: accountId, intervalSeconds: 300 }));
 assert.equal(bearerToken("Bearer rental-secret"), "rental-secret");
 assert.equal(secretMatches("rental-secret", "rental-secret"), true);
