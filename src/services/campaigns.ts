@@ -79,6 +79,49 @@ export async function addTarget(db: Database.Database, tenantId: string, id: num
   })();
   writeAudit(db, tenantId, "target_added", { campaignId: id, chatId });
 }
+export async function selectAllTargets(db: Database.Database, tenantId: string, id: number): Promise<{ selected: number; skipped: number }> {
+  const current = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tenantId, id) as { senderAccountId: string } | undefined;
+  if (!current) throw new Error("campaign not found");
+  requireAccount(db, tenantId, current.senderAccountId, true);
+  const groups = db.prepare("SELECT chatId,enabled FROM groups WHERE tenantId=? AND accountId=? ORDER BY title").all(tenantId, current.senderAccountId) as Array<{ chatId: string; enabled: number }>;
+  const adapter = adapterFor(db, tenantId, current.senderAccountId);
+  const allowed: string[] = [];
+  let skipped = 0;
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(8, groups.length) }, async () => {
+    while (cursor < groups.length) {
+      const group = groups[cursor++]!;
+      if (group.chatId === config.archiveChat) { skipped++; continue; }
+      if (group.enabled) { allowed.push(group.chatId); continue; }
+      try { if (await adapter.canPost(group.chatId)) allowed.push(group.chatId); else skipped++; }
+      catch { skipped++; }
+    }
+  }));
+  const count = db.prepare("SELECT COUNT(*) AS n FROM campaignTargets WHERE tenantId=? AND campaignId=?").get(tenantId, id) as { n: number };
+  const existing = new Set((db.prepare("SELECT chatId FROM campaignTargets WHERE tenantId=? AND campaignId=?").all(tenantId, id) as Array<{ chatId: string }>).map((row) => row.chatId));
+  if (count.n + allowed.filter((chatId) => !existing.has(chatId)).length > limitFor(db, tenantId, "targets")) throw new Error("target limit reached");
+  const enabledGroups = (db.prepare("SELECT COUNT(*) AS n FROM groups WHERE tenantId=? AND enabled=1").get(tenantId) as { n: number }).n;
+  const disabled = new Set(groups.filter((group) => !group.enabled).map((group) => group.chatId));
+  const enableCount = allowed.filter((chatId) => disabled.has(chatId)).length;
+  if (enabledGroups + enableCount > limitFor(db, tenantId, "groups")) throw new Error("enabled group limit reached");
+  const timestamp = now();
+  const enableGroup = db.prepare("UPDATE groups SET enabled=1,updatedAt=? WHERE tenantId=? AND accountId=? AND chatId=?");
+  const add = db.prepare("INSERT INTO campaignTargets (campaignId,tenantId,accountId,chatId,createdAt,updatedAt) VALUES (?,?,?,?,?,?) ON CONFLICT(campaignId,chatId) DO UPDATE SET enabled=1,updatedAt=excluded.updatedAt");
+  db.transaction(() => {
+    for (const chatId of allowed) {
+      enableGroup.run(timestamp, tenantId, current.senderAccountId, chatId);
+      add.run(id, tenantId, current.senderAccountId, chatId, timestamp, timestamp);
+    }
+  })();
+  writeAudit(db, tenantId, "targets_selected_all", { campaignId: id, selected: allowed.length, skipped });
+  return { selected: allowed.length, skipped };
+}
+export function clearTargets(db: Database.Database, tenantId: string, id: number): number {
+  if (!campaign(db, tenantId, id)) throw new Error("campaign not found");
+  const changed = db.prepare("UPDATE campaignTargets SET enabled=0,updatedAt=? WHERE tenantId=? AND campaignId=? AND enabled=1").run(now(), tenantId, id).changes;
+  if (changed) writeAudit(db, tenantId, "targets_cleared", { campaignId: id, count: changed });
+  return changed;
+}
 export function updateTarget(db: Database.Database, tenantId: string, id: number, chatId: string, enabled: unknown): void { if (typeof enabled !== "boolean") throw new Error("enabled must be boolean"); const result = db.prepare("UPDATE campaignTargets SET enabled = ?, updatedAt = ? WHERE campaignId = ? AND tenantId = ? AND chatId = ?").run(enabled ? 1 : 0, now(), id, tenantId, chatId); if (!result.changes) throw new Error("target not found"); writeAudit(db, tenantId, enabled ? "target_enabled" : "target_disabled", { campaignId: id, chatId }); }
 export function deleteTarget(db: Database.Database, tenantId: string, id: number, chatId: string): void { db.prepare("DELETE FROM campaignTargets WHERE campaignId = ? AND tenantId = ? AND chatId = ?").run(id, tenantId, chatId); writeAudit(db, tenantId, "target_deleted", { campaignId: id, chatId }); }
 export function detail(db: Database.Database, tenantId: string, id: number): unknown { const row = campaign(db, tenantId, id); return row ? { ...(row as object), targets: db.prepare("SELECT * FROM campaignTargets WHERE tenantId = ? AND campaignId = ?").all(tenantId, id) } : undefined; }
