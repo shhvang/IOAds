@@ -28,17 +28,20 @@ hub-provisioned tenants remain separate.
 With `ADS_BOT_USERNAME` configured and inline mode enabled in BotFather, new
 text, supported media, and rich-message campaigns use one private inline result
 per campaign. The inline payload retains its entities, rich blocks, cached media,
-captions, link preview settings, and inline keyboard. Empty or ordinary inline
-queries show one IOAds feature result and a button to open the bot in private
-chat; campaign content is returned only for an explicit authorized campaign
-query. Inline campaign posts add one small "posted by IOAds" button linking to
-the bot's private chat, with the IOAds logo custom emoji as its icon. The
-original content and buttons remain intact. Telegram may restrict custom emoji
-icons in inline results to bots with an additional username purchased on
-Fragment; if Telegram rejects the icon, the bot retries with the same button
-without the icon. Direct copies cannot carry this button. The bot reports failed
-deliveries if Telegram rejects them; it does not replace the post with altered
-text.
+captions, and the original inline keyboard. Empty or ordinary inline queries
+show one IOAds feature result with a rich-message button to open the bot in
+private chat; campaign content is returned only for an explicit authorized
+campaign query. Supported campaign posts add one small rich-message button
+inside the post, labeled "posted by IOAds" with the IOAds logo custom emoji.
+The button opens the bot's private chat; any original buttons remain intact.
+Link-preview options, stickers, and captions displayed above media retain their
+original inline result format because rich messages cannot represent all their
+settings. Direct copies cannot carry the rich-message button. Telegram restricts
+custom emoji in inline results to bots with an additional username purchased
+on Fragment. If Telegram rejects the IOAds logo, the bot retries with the same
+rich-message button without its logo; campaign custom emoji are never removed.
+The bot reports failed deliveries if Telegram rejects them; it does not replace
+the post with altered text.
 
 Set `ADS_ARCHIVE_CHAT` to a private chat accessible to the connected accounts
 when direct copies or media features unsupported by inline mode are needed.

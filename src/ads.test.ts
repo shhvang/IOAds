@@ -20,7 +20,7 @@ import { rawAmount } from "./payments.js";
 import { tierLimits } from "./services/plans.js";
 import { button, editRich, richHtml } from "./bot-ui.js";
 import { cachedInlineMedia } from "./bot.js";
-import { inlineResults, reusableRichMessage, withoutAttributionIcons, IOADS_LOGO_EMOJI_ID } from "./inline.js";
+import { inlineResults, reusableRichMessage, textWithEntitiesHtml, withoutAttributionEmoji, IOADS_LOGO_EMOJI_ID } from "./inline.js";
 import { seal } from "./lib/crypto.js";
 import { getTdlibInfo } from "prebuilt-tdlib";
 import express from "express";
@@ -73,7 +73,10 @@ assert.equal(inlineResults(db, 123456, "", config.botUsername).length, 1);
 assert.equal(inlineResults(db, 123456, "search", config.botUsername)[0]?.id, "ioads-features");
 const feature = inlineResults(db, 123456, "", config.botUsername)[0];
 assert.equal(feature?.type, "article");
-if (feature?.type === "article") assert.deepEqual(feature.reply_markup, { inline_keyboard: [[{ text: "Open IOAds", icon_custom_emoji_id: IOADS_LOGO_EMOJI_ID, url: "https://t.me/ioads_test_bot?start=inline" }]] });
+if (feature?.type === "article") {
+  assert.equal(feature.reply_markup, undefined);
+  assert.match(JSON.stringify(feature.input_message_content), /tg-button-row.*Open IOAds/);
+}
 assert.deepEqual(inlineResults(db, 123456, `campaign:${sourceCampaign.id}`, config.botUsername), []);
 assert.equal(inlineResults(db, 42, `campaign:${sourceCampaign.id}`, config.botUsername).length, 0);
 db.prepare("UPDATE campaigns SET sourceChatId = ?, sourceMessageId = ?, nextRunAt = ? WHERE id = ?").run("archive", 9, "2000-01-01T00:00:00.000Z", sourceCampaign.id);
@@ -84,24 +87,43 @@ assert.deepEqual(copied, ["-100123", "archive", 9]);
 db.prepare("UPDATE accounts SET telegramUserId = ? WHERE tenantId = ? AND accountId = ?").run(987654, "tenant-a", accountId);
 assert.equal(inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername).length, 1);
 assert.deepEqual(inlineResults(db, 123456, `campaign:${sourceCampaign.id}`, config.botUsername), []);
-const emojiEntity = { type: "custom_emoji", offset: 0, length: 2, custom_emoji_id: "123" };
+const emojiEntity = { type: "custom_emoji" as const, offset: 0, length: 2, custom_emoji_id: "123" };
 const originalMarkup = { inline_keyboard: [[{ text: "Visit", url: "https://example.com" }]] };
-db.prepare("UPDATE campaigns SET message='⭐ Offer', messageEntities=?, inlineOptions=? WHERE id=?")
+db.prepare("UPDATE campaigns SET message='⭐️ Offer', messageEntities=?, inlineOptions=? WHERE id=?")
   .run(JSON.stringify([emojiEntity]), JSON.stringify({ link_preview_options: { is_disabled: true }, reply_markup: originalMarkup }), sourceCampaign.id);
 const textResult = inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername)[0];
 assert.equal(textResult?.type, "article");
 if (textResult?.type === "article") {
-  assert.deepEqual(textResult.input_message_content, { message_text: "⭐ Offer", entities: [emojiEntity], link_preview_options: { is_disabled: true } });
-  assert.deepEqual(textResult.reply_markup, { inline_keyboard: [...originalMarkup.inline_keyboard, [{ text: "posted by IOAds", icon_custom_emoji_id: IOADS_LOGO_EMOJI_ID, url: "https://t.me/ioads_test_bot?start=posted" }]] });
-  const plain = withoutAttributionIcons([textResult])[0];
-  if (plain?.type === "article") assert.deepEqual(plain.reply_markup, { inline_keyboard: [...originalMarkup.inline_keyboard, [{ text: "posted by IOAds", url: "https://t.me/ioads_test_bot?start=posted" }]] });
+  assert.deepEqual(textResult.input_message_content, { message_text: "⭐️ Offer", entities: [emojiEntity], link_preview_options: { is_disabled: true } });
+  assert.deepEqual(textResult.reply_markup, originalMarkup);
 }
+db.prepare("UPDATE campaigns SET inlineOptions=? WHERE id=?").run(JSON.stringify({ reply_markup: originalMarkup }), sourceCampaign.id);
+const richTextResult = inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername)[0];
+assert.equal(richTextResult?.type, "article");
+if (richTextResult?.type === "article") {
+  assert.deepEqual(richTextResult.reply_markup, originalMarkup);
+  assert.match(JSON.stringify(richTextResult.input_message_content), new RegExp(`tg-emoji emoji-id=\\\\"${emojiEntity.custom_emoji_id}`));
+  assert.match(JSON.stringify(richTextResult.input_message_content), new RegExp(`tg-button-row.*${IOADS_LOGO_EMOJI_ID}.*posted by IOAds`));
+  const plain = withoutAttributionEmoji([richTextResult])[0];
+  assert.match(JSON.stringify(plain), /posted by IOAds/);
+  assert.doesNotMatch(JSON.stringify(plain), new RegExp(IOADS_LOGO_EMOJI_ID));
+  assert.match(JSON.stringify(plain), /custom_emoji_id|emoji-id.*123/);
+}
+assert.equal(textWithEntitiesHtml("⭐️ <Offer>", [emojiEntity]), '<tg-emoji emoji-id="123">⭐️</tg-emoji> &lt;Offer&gt;');
 db.prepare("UPDATE campaigns SET inlineMode = 1, nextRunAt = ? WHERE id = ?").run("2001-01-01T00:00:00.000Z", sourceCampaign.id);
 await runSchedulerOnce(db, () => adapter);
 assert.deepEqual(adapter.inlineSent.at(-1), { chatId: "-100123", query: `campaign:${sourceCampaign.id}` });
 assert.equal(adapter.inlineSent.length, 1);
 const animation = cachedInlineMedia({ animation: { file_id: "animation-id", mime_type: "video/mp4" }, document: { file_id: "document-id" }, caption: "A caption", show_caption_above_media: true } as Parameters<typeof cachedInlineMedia>[0]);
 assert.deepEqual(animation, { type: "mpeg4_gif", mpeg4_file_id: "animation-id", caption: "A caption", caption_entities: undefined, show_caption_above_media: true });
+db.prepare("UPDATE campaigns SET richMessage=?,richContent=NULL,contentKind='media' WHERE id=?")
+  .run(JSON.stringify({ type: "photo", photo_file_id: "photo-id", caption: "⭐️ Offer", caption_entities: [emojiEntity] }), sourceCampaign.id);
+const mediaResult = inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername)[0];
+assert.equal(mediaResult?.type, "article");
+if (mediaResult?.type === "article" && "rich_message" in mediaResult.input_message_content) {
+  assert.deepEqual(mediaResult.input_message_content.rich_message.blocks?.[0], { type: "photo", photo: { type: "photo", media: "photo-id" }, caption: { text: [{ type: "custom_emoji", custom_emoji_id: "123", alternative_text: "⭐️" }, " Offer"] } });
+  assert.equal(mediaResult.input_message_content.rich_message.blocks?.at(-1)?.type, "buttons");
+}
 const rich = reusableRichMessage({ blocks: [
   { type: "heading", size: 2, text: { type: "bold", text: "Offer" } },
   { type: "paragraph", text: { type: "custom_emoji", custom_emoji_id: "123", alternative_text: "⭐" } },
@@ -112,7 +134,10 @@ assert.deepEqual(rich.blocks?.[2], { type: "photo", photo: { type: "photo", medi
 db.prepare("UPDATE campaigns SET richContent=?,contentKind='rich' WHERE id=?").run(JSON.stringify(rich), sourceCampaign.id);
 const richResult = inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername)[0];
 assert.equal(richResult?.type, "article");
-if (richResult?.type === "article") assert.deepEqual(richResult.input_message_content, { rich_message: rich });
+if (richResult?.type === "article" && "rich_message" in richResult.input_message_content) {
+  assert.deepEqual(richResult.input_message_content.rich_message.blocks?.slice(0, -1), rich.blocks);
+  assert.deepEqual(richResult.input_message_content.rich_message.blocks?.at(-1), { type: "buttons", align: "right", buttons: [{ text: [{ type: "custom_emoji", custom_emoji_id: IOADS_LOGO_EMOJI_ID, alternative_text: "📣" }, " posted by IOAds"], url: "https://t.me/ioads_test_bot?start=posted" }] });
+}
 config.botUsername = originalBotUsername;
 const originalArchiveChat = config.archiveChat;
 config.archiveChat = "-100206";

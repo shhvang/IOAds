@@ -12,7 +12,7 @@ import { tierLimits } from "./services/plans.js";
 import { enforceTenantLimits } from "./services/limits.js";
 import { paymentMethods, verifyPayment, type PaymentMethod } from "./payments.js";
 import { back, button, editRich, editRichAt, escapeHtml, menu, replyRich, type Button } from "./bot-ui.js";
-import { inlineResults, reusableRichMessage, withoutAttributionIcons } from "./inline.js";
+import { inlineResults, reusableRichMessage, withoutAttributionEmoji } from "./inline.js";
 
 type Flow = { action: "phone" | "sending_code" | "code" | "password" | "verifying_code" | "campaign" | "payment"; accountId?: string; phone?: string; code?: string; tier?: string; method?: PaymentMethod; paymentId?: number; uiMessageId?: number };
 type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
@@ -342,7 +342,7 @@ export function startAdsBot(db: Database.Database): void {
       await ctx.answerInlineQuery(results, options);
     } catch (error) {
       if (!/button_icon|custom emoji|icon_custom_emoji_id|fragment|premium/i.test(String(error))) throw error;
-      await ctx.answerInlineQuery(withoutAttributionIcons(results), options);
+      await ctx.answerInlineQuery(withoutAttributionEmoji(results), options);
     }
   });
   bot.callbackQuery("newcampaign", async (ctx) => {
