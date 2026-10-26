@@ -33,7 +33,26 @@ export function limitFor(db: Database.Database, tenantId: string, key: keyof Lim
   return tenantLimits(db, tenantId)[key];
 }
 
+/** Existing sessions must obey the same owner/account rule as new logins. */
+export function revokeOwnerAccounts(db: Database.Database, tenantId?: string): number {
+  const rows = db.prepare(`SELECT a.tenantId,a.accountId FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId
+    WHERE a.telegramUserId=t.ownerId AND (? IS NULL OR a.tenantId=?) AND (a.session IS NOT NULL OR a.status IN ('active','limit_paused'))`)
+    .all(tenantId ?? null, tenantId ?? null) as Array<{ tenantId: string; accountId: string }>;
+  db.transaction(() => {
+    for (const row of rows) {
+      db.prepare("UPDATE accounts SET status='logged_out',session=NULL,loginPhone=NULL,phoneCodeHash=NULL,updatedAt=? WHERE tenantId=? AND accountId=?")
+        .run(new Date().toISOString(), row.tenantId, row.accountId);
+      db.prepare("UPDATE groups SET enabled=0,updatedAt=? WHERE tenantId=? AND accountId=?")
+        .run(new Date().toISOString(), row.tenantId, row.accountId);
+      db.prepare("UPDATE campaignTargets SET enabled=0,updatedAt=? WHERE tenantId=? AND accountId=?")
+        .run(new Date().toISOString(), row.tenantId, row.accountId);
+    }
+  })();
+  return rows.length;
+}
+
 export function enforceTenantLimits(db: Database.Database, tenantId: string): void {
+  revokeOwnerAccounts(db, tenantId);
   const limits = tenantLimits(db, tenantId);
   db.transaction(() => {
     db.prepare(`UPDATE groups SET enabled = 0, updatedAt = datetime('now') WHERE tenantId = ? AND enabled = 1 AND chatKind='group' AND rowid NOT IN

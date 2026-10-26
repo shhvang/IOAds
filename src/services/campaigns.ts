@@ -49,8 +49,8 @@ export function setCampaignStatus(db: Database.Database, tenantId: string, id: n
     if (current.status === "cancelled" && Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId=? AND id!=? AND status!='cancelled'").get(tenantId, id) as { n: number }).n) >= limitFor(db, tenantId, "campaigns")) throw new Error("campaign limit reached");
     const target = db.prepare(`SELECT 1 FROM campaignTargets ct JOIN groups g
       ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId
-      JOIN accounts a ON a.tenantId=ct.tenantId AND a.accountId=ct.accountId
-      WHERE ct.tenantId=? AND ct.campaignId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' AND a.status='active' AND a.session IS NOT NULL LIMIT 1`)
+      JOIN accounts a ON a.tenantId=ct.tenantId AND a.accountId=ct.accountId JOIN tenants t ON t.tenantId=ct.tenantId
+      WHERE ct.tenantId=? AND ct.campaignId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' AND a.status='active' AND a.session IS NOT NULL AND a.telegramUserId IS NOT NULL AND a.telegramUserId!=t.ownerId LIMIT 1`)
       .get(tenantId, id);
     if (!target) throw new Error("Choose at least one enabled group before scheduling this campaign.");
   }

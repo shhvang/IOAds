@@ -13,6 +13,7 @@ import { Bot } from "grammy";
 import { enforceTenantLimits } from "./services/limits.js";
 import { startWorkerPool } from "./services/worker-pool.js";
 import { cancelLogin } from "./services/account.js";
+import { tierLimits } from "./services/plans.js";
 
 validateConfig();
 const db = openDb(`${config.dataDir}/ads.db`);
@@ -32,10 +33,10 @@ if (config.botToken) {
     for (const user of expired) {
       db.transaction(() => {
         db.prepare("UPDATE localUsers SET tierCode = 'free', paidUntil = NULL, updatedAt = ? WHERE telegramId = ?").run(new Date().toISOString(), user.telegramId);
-        db.prepare("UPDATE tenants SET tierCode = 'free', limits = ?, version = version + 1, updatedAt = ? WHERE tenantId = ?").run(JSON.stringify({ accounts: 1, groups: 1_000_000, campaigns: 1, targets: 1_000_000, dailyMessages: 500 }), new Date().toISOString(), user.tenantId);
+        db.prepare("UPDATE tenants SET tierCode = 'free', limits = ?, version = version + 1, updatedAt = ? WHERE tenantId = ?").run(JSON.stringify(tierLimits("free")), new Date().toISOString(), user.tenantId);
         enforceTenantLimits(db, user.tenantId);
       })();
-      void bot.api.sendMessage(user.telegramId, "Your paid plan ended. Your account is now on Free: 500 messages/day, 1 userbot and 1 campaign.").catch(() => undefined);
+      void bot.api.sendMessage(user.telegramId, "Your paid plan ended. Your account is now on Free: 2,000 messages/day, 1 userbot and 1 campaign.").catch(() => undefined);
     }
   }, 60_000).unref();
 }

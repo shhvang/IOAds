@@ -17,7 +17,10 @@ import { createApiRouter } from "./api.js";
 import { bearerToken, secretMatches } from "./rental/contract.js";
 import { storeControlBotToken } from "./rental/secrets.js";
 import { rawAmount } from "./payments.js";
-import { button, richHtml } from "./bot-ui.js";
+import { tierLimits } from "./services/plans.js";
+import { button, editRich, richHtml } from "./bot-ui.js";
+import { cachedInlineMedia } from "./bot.js";
+import { inlineResults, reusableRichMessage, withoutAttributionIcons, IOADS_LOGO_EMOJI_ID } from "./inline.js";
 import { seal } from "./lib/crypto.js";
 import { getTdlibInfo } from "prebuilt-tdlib";
 import express from "express";
@@ -26,9 +29,21 @@ import type { AddressInfo } from "node:net";
 const db = openDb(":memory:");
 assert.equal(richHtml("<unsafe>&", [[button("Select all", "alltargets:1:0", "success")]]), "<p>&lt;unsafe&gt;&amp;</p><tg-button-row><tg-button type=\"callback_data\" data=\"alltargets:1:0\" style=\"success\">Select all</tg-button></tg-button-row>");
 assert.match(richHtml("Groups", [[button("Back", "home", "link", "back")]]), /<tg-emoji emoji-id="5877629862306385808">◀️<\/tg-emoji> Back/);
+let edits = 0, newMessages = 0;
+await editRich({ chat: { id: 42 }, callbackQuery: { message: { message_id: 7 } }, api: { raw: {
+  editMessageText: async () => { edits += 1; }, sendRichMessage: async () => { newMessages += 1; },
+} } } as unknown as Parameters<typeof editRich>[0], "Updated screen");
+assert.deepEqual({ edits, newMessages }, { edits: 1, newMessages: 0 });
+await editRich({ chat: { id: 42 }, callbackQuery: { message: { message_id: 7 } }, api: { raw: {
+  editMessageText: async () => { throw new Error("Bad Request: message is not modified"); },
+  sendRichMessage: async () => { newMessages += 1; },
+} } } as unknown as Parameters<typeof editRich>[0], "Updated screen");
+assert.equal(newMessages, 0);
 assert.equal(rawAmount("1000000", 6), 1);
 assert.equal(rawAmount("999999", 6), 0.99);
 assert.equal(Number.isNaN(rawAmount("not-a-number", 6)), true);
+assert.deepEqual(["free", "pro", "business"].map((tier) => tierLimits(tier).dailyMessages), [2000, 5000, 15000]);
+assert.deepEqual(["free", "pro", "business"].map((tier) => tierLimits(tier).accounts), [1, 5, 15]);
 assert.match(getTdlibInfo().version, /^1\.8\./);
 const desired = { tenantId: "tenant-a", productId: "ads", ownerTelegramId: 42, state: "active", tierCode: "starter", runtime: "service", version: 1, trial: false, suspendReason: null, periodEnd: null, retainUntil: null, limits: {}, secretsFingerprint: null, expectData: false, config: {}, updatedAt: new Date().toISOString() } as const;
 config.sessionEncryptionKey = "test-session-key";
@@ -38,7 +53,7 @@ assert.equal(applyDesired(db, desired), "apply");
 assert.equal(applyDesired(db, { ...desired, version: 0 }), "stale");
 assert.equal(tierRank("pro") > tierRank("starter"), true);
 const accountId = "account-a";
-db.prepare("INSERT INTO accounts (accountId, tenantId, ownerId, session, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, 'active', ?, ?)").run(accountId, "tenant-a", 42, "fake", new Date().toISOString(), new Date().toISOString());
+db.prepare("INSERT INTO accounts (accountId, tenantId, ownerId, telegramUserId, session, status, createdAt, updatedAt) VALUES (?, ?, ?, 987654, ?, 'active', ?, ?)").run(accountId, "tenant-a", 42, "fake", new Date().toISOString(), new Date().toISOString());
 db.prepare("INSERT INTO groups (tenantId, accountId, chatId, title, chatKind, createdAt, updatedAt) VALUES (?, ?, ?, ?, 'group', ?, ?)").run("tenant-a", accountId, "-100123", "Group", new Date().toISOString(), new Date().toISOString());
 setAdapterForTest("tenant-a", accountId, new FakeTelegramAdapter());
 await assert.rejects(() => setGroup(db, "tenant-a", accountId, "-100123", true, "custom", tierRank("starter")));
@@ -52,15 +67,53 @@ assert.equal(sent, 1);
 assert.equal(adapter.sent[0]?.message, "default");
 assert.equal((db.prepare("SELECT status FROM deliveries LIMIT 1").get() as { status: string }).status, "sent");
 const sourceCampaign = campaign as { id: number };
+const originalBotUsername = config.botUsername;
+config.botUsername = "ioads_test_bot";
+assert.equal(inlineResults(db, 123456, "", config.botUsername).length, 1);
+assert.equal(inlineResults(db, 123456, "search", config.botUsername)[0]?.id, "ioads-features");
+const feature = inlineResults(db, 123456, "", config.botUsername)[0];
+assert.equal(feature?.type, "article");
+if (feature?.type === "article") assert.deepEqual(feature.reply_markup, { inline_keyboard: [[{ text: "Open IOAds", icon_custom_emoji_id: IOADS_LOGO_EMOJI_ID, url: "https://t.me/ioads_test_bot?start=inline" }]] });
+assert.deepEqual(inlineResults(db, 123456, `campaign:${sourceCampaign.id}`, config.botUsername), []);
+assert.equal(inlineResults(db, 42, `campaign:${sourceCampaign.id}`, config.botUsername).length, 0);
 db.prepare("UPDATE campaigns SET sourceChatId = ?, sourceMessageId = ?, nextRunAt = ? WHERE id = ?").run("archive", 9, "2000-01-01T00:00:00.000Z", sourceCampaign.id);
 let copied: [string, string, number] | null = null;
 adapter.copyMessage = async (chatId, sourceChatId, messageId) => { copied = [chatId, sourceChatId, messageId]; };
 await runSchedulerOnce(db, () => adapter);
 assert.deepEqual(copied, ["-100123", "archive", 9]);
 db.prepare("UPDATE accounts SET telegramUserId = ? WHERE tenantId = ? AND accountId = ?").run(987654, "tenant-a", accountId);
+assert.equal(inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername).length, 1);
+assert.deepEqual(inlineResults(db, 123456, `campaign:${sourceCampaign.id}`, config.botUsername), []);
+const emojiEntity = { type: "custom_emoji", offset: 0, length: 2, custom_emoji_id: "123" };
+const originalMarkup = { inline_keyboard: [[{ text: "Visit", url: "https://example.com" }]] };
+db.prepare("UPDATE campaigns SET message='⭐ Offer', messageEntities=?, inlineOptions=? WHERE id=?")
+  .run(JSON.stringify([emojiEntity]), JSON.stringify({ link_preview_options: { is_disabled: true }, reply_markup: originalMarkup }), sourceCampaign.id);
+const textResult = inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername)[0];
+assert.equal(textResult?.type, "article");
+if (textResult?.type === "article") {
+  assert.deepEqual(textResult.input_message_content, { message_text: "⭐ Offer", entities: [emojiEntity], link_preview_options: { is_disabled: true } });
+  assert.deepEqual(textResult.reply_markup, { inline_keyboard: [...originalMarkup.inline_keyboard, [{ text: "posted by IOAds", icon_custom_emoji_id: IOADS_LOGO_EMOJI_ID, url: "https://t.me/ioads_test_bot?start=posted" }]] });
+  const plain = withoutAttributionIcons([textResult])[0];
+  if (plain?.type === "article") assert.deepEqual(plain.reply_markup, { inline_keyboard: [...originalMarkup.inline_keyboard, [{ text: "posted by IOAds", url: "https://t.me/ioads_test_bot?start=posted" }]] });
+}
 db.prepare("UPDATE campaigns SET inlineMode = 1, nextRunAt = ? WHERE id = ?").run("2001-01-01T00:00:00.000Z", sourceCampaign.id);
 await runSchedulerOnce(db, () => adapter);
 assert.deepEqual(adapter.inlineSent.at(-1), { chatId: "-100123", query: `campaign:${sourceCampaign.id}` });
+assert.equal(adapter.inlineSent.length, 1);
+const animation = cachedInlineMedia({ animation: { file_id: "animation-id", mime_type: "video/mp4" }, document: { file_id: "document-id" }, caption: "A caption", show_caption_above_media: true } as Parameters<typeof cachedInlineMedia>[0]);
+assert.deepEqual(animation, { type: "mpeg4_gif", mpeg4_file_id: "animation-id", caption: "A caption", caption_entities: undefined, show_caption_above_media: true });
+const rich = reusableRichMessage({ blocks: [
+  { type: "heading", size: 2, text: { type: "bold", text: "Offer" } },
+  { type: "paragraph", text: { type: "custom_emoji", custom_emoji_id: "123", alternative_text: "⭐" } },
+  { type: "photo", photo: [{ file_id: "cached-photo", file_unique_id: "unique", width: 100, height: 100 }], has_spoiler: true },
+] } as Parameters<typeof reusableRichMessage>[0]);
+assert.throws(() => reusableRichMessage({ blocks: [{ type: "buttons", buttons: [{ text: "Action", callback_data: "other-bot" }] }] } as Parameters<typeof reusableRichMessage>[0]), /buttons tied to another bot/);
+assert.deepEqual(rich.blocks?.[2], { type: "photo", photo: { type: "photo", media: "cached-photo" }, has_spoiler: true });
+db.prepare("UPDATE campaigns SET richContent=?,contentKind='rich' WHERE id=?").run(JSON.stringify(rich), sourceCampaign.id);
+const richResult = inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername)[0];
+assert.equal(richResult?.type, "article");
+if (richResult?.type === "article") assert.deepEqual(richResult.input_message_content, { rich_message: rich });
+config.botUsername = originalBotUsername;
 const originalArchiveChat = config.archiveChat;
 config.archiveChat = "-100206";
 const selective = new FakeTelegramAdapter();
@@ -112,6 +165,12 @@ setAdapterForTest("tenant-login", "duplicate-attempt", duplicateAdapter);
 await loginStart(loginDb, "tenant-login", "+12345678903", "duplicate-attempt");
 await assert.rejects(() => loginComplete(loginDb, "tenant-login", "duplicate-attempt", "+12345678903", "12345"), /already connected/);
 assert.equal(loginDb.prepare("SELECT 1 FROM accounts WHERE accountId='duplicate-attempt'").get(), undefined);
+const ownerAdapter = new FakeTelegramAdapter();
+ownerAdapter.signIn = async () => ({ session: "owner-session", userId: 42, displayName: "Owner" });
+setAdapterForTest("tenant-login", "owner-attempt", ownerAdapter);
+await loginStart(loginDb, "tenant-login", "+12345678904", "owner-attempt");
+await assert.rejects(() => loginComplete(loginDb, "tenant-login", "owner-attempt", "+12345678904", "12345"), /account operating this bot cannot be connected/);
+assert.equal(loginDb.prepare("SELECT 1 FROM accounts WHERE accountId='owner-attempt'").get(), undefined);
 const savedLogin = loginDb.prepare("SELECT session,status FROM accounts WHERE accountId='new-account'").get();
 loginAdapter.logout = async () => { throw new Error("Telegram unavailable"); };
 await assert.rejects(() => logout(loginDb, "tenant-login", "new-account"), /Telegram unavailable/);
@@ -121,6 +180,19 @@ loginDb.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,status,created
 await deleteAccount(loginDb, "tenant-login", "failed-attempt");
 assert.equal(loginDb.prepare("SELECT 1 FROM accounts WHERE accountId='failed-attempt'").get(), undefined);
 loginDb.close();
+const policyDir = mkdtempSync(join(tmpdir(), "ioads-policy-"));
+const policyPath = join(policyDir, "ads.sqlite");
+const policyDb = openDb(policyPath);
+applyDesired(policyDb, { ...desired, tenantId: "ads:42", tierCode: "free" });
+policyDb.prepare("INSERT INTO localUsers (telegramId,tenantId,tierCode,forceJoined,createdAt,updatedAt) VALUES (42,'ads:42','free',1,?,?)").run(now(), now());
+policyDb.prepare("UPDATE tenants SET limits=? WHERE tenantId='ads:42'").run(JSON.stringify({ ...tierLimits("free"), dailyMessages: 500 }));
+policyDb.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,telegramUserId,session,status,createdAt,updatedAt) VALUES ('owner-saved','ads:42',42,42,'fake','active',?,?)").run(now(), now());
+policyDb.close();
+const migratedPolicy = openDb(policyPath);
+assert.equal((JSON.parse((migratedPolicy.prepare("SELECT limits FROM tenants WHERE tenantId='ads:42'").get() as { limits: string }).limits) as { dailyMessages: number }).dailyMessages, 2000);
+assert.deepEqual(migratedPolicy.prepare("SELECT status,session FROM accounts WHERE accountId='owner-saved'").get(), { status: "logged_out", session: null });
+migratedPolicy.close();
+rmSync(policyDir, { recursive: true, force: true });
 const restartDir = mkdtempSync(join(tmpdir(), "ioads-restart-"));
 const restartPath = join(restartDir, "ads.sqlite");
 const restartDb = openDb(restartPath);
@@ -148,6 +220,16 @@ setAdapterForTest("tenant-restart", "recoverable", new FakeTelegramAdapter());
 assert.equal(canRestoreAccount(reopened, "tenant-restart", "recoverable"), true);
 assert.equal(await restoreAccount(reopened, "tenant-restart", "recoverable"), true);
 assert.equal((reopened.prepare("SELECT status FROM accounts WHERE accountId='recoverable'").get() as { status: string }).status, "active");
+reopened.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,phone,status,createdAt,updatedAt) VALUES ('owner-restore','tenant-restart',42,'+12345678909','logged_out',?,?)").run(now(), now());
+const ownerTdlibDir = join(restartDir, "tdlib", createHash("sha256").update("owner-restore").digest("hex"));
+mkdirSync(ownerTdlibDir, { recursive: true });
+writeFileSync(join(ownerTdlibDir, "td.binlog"), "saved owner session fixture");
+const ownerRestoreAdapter = new FakeTelegramAdapter();
+ownerRestoreAdapter.resumeSession = async () => ({ userId: 42, displayName: "Owner" });
+setAdapterForTest("tenant-restart", "owner-restore", ownerRestoreAdapter);
+assert.equal(canRestoreAccount(reopened, "tenant-restart", "owner-restore"), true);
+await assert.rejects(() => restoreAccount(reopened, "tenant-restart", "owner-restore"), /account operating this bot cannot be connected/);
+assert.equal((reopened.prepare("SELECT status FROM accounts WHERE accountId='owner-restore'").get() as { status: string }).status, "logged_out");
 config.dataDir = originalDataDir;
 reopened.close();
 rmSync(restartDir, { recursive: true, force: true });
@@ -156,7 +238,7 @@ const migrationPath = join(migrationDir, "ads.sqlite");
 const oldTargetsDb = openDb(migrationPath);
 applyDesired(oldTargetsDb, { ...desired, tenantId: "tenant-migration", tierCode: "pro" });
 for (const id of ["one", "two"]) {
-  oldTargetsDb.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,session,status,createdAt,updatedAt) VALUES (?,'tenant-migration',42,'fake','active',?,?)").run(id, now(), now());
+  oldTargetsDb.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,telegramUserId,session,status,createdAt,updatedAt) VALUES (?,'tenant-migration',42,?,'fake','active',?,?)").run(id, id === "one" ? 101 : 102, now(), now());
   oldTargetsDb.prepare("INSERT INTO groups (tenantId,accountId,chatId,title,chatKind,enabled,createdAt,updatedAt) VALUES ('tenant-migration',?,'-1001','Shared','group',1,?,?)").run(id, now(), now());
 }
 const migrationCampaign = createCampaign(oldTargetsDb, "tenant-migration", { name: "Preserved", message: "hello", senderAccountId: "one" }) as { id: number };

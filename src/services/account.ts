@@ -5,11 +5,17 @@ import { now } from "../db.js";
 import { seal } from "../lib/crypto.js";
 import { createTelegramAdapter, hasTdlibSession, removeTdlibSession, type TelegramAdapter } from "../telegram.js";
 import { remoteAdapterFor } from "./worker-pool.js";
-import { enforceTenantLimits, limitFor } from "./limits.js";
+import { enforceTenantLimits, limitFor, revokeOwnerAccounts } from "./limits.js";
 
 const adapters = new Map<string, TelegramAdapter>();
 const testAdapters = new Map<string, TelegramAdapter>();
 const key = (tenantId: string, accountId: string): string => `${tenantId}:${accountId}`;
+const ownerAccountError = "Use a different Telegram account for the userbot. The account operating this bot cannot be connected as a sender.";
+function ownerId(db: Database.Database, tenantId: string): number {
+  const row = db.prepare("SELECT ownerId FROM tenants WHERE tenantId=?").get(tenantId) as { ownerId: number } | undefined;
+  if (!row) throw new Error("tenant not found");
+  return row.ownerId;
+}
 
 export function setAdapterForTest(tenantId: string, accountId: string, adapter: TelegramAdapter): void { testAdapters.set(key(tenantId, accountId), adapter); }
 
@@ -36,8 +42,8 @@ export function accountStatus(db: Database.Database, tenantId: string, accountId
 }
 
 export function activeAccount(db: Database.Database, tenantId: string, accountId: string): boolean {
-  const row = db.prepare("SELECT status, session FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { status: string; session: string | null } | undefined;
-  return row?.status === "active" && Boolean(row.session);
+  const row = db.prepare("SELECT a.status,a.session,a.telegramUserId,t.ownerId FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId WHERE a.tenantId = ? AND a.accountId = ?").get(tenantId, accountId) as { status: string; session: string | null; telegramUserId: number | null; ownerId: number } | undefined;
+  return row?.status === "active" && Boolean(row.session) && row.telegramUserId != null && row.telegramUserId !== row.ownerId;
 }
 
 export function requireAccount(db: Database.Database, tenantId: string, accountId: string, active = false): void {
@@ -60,7 +66,15 @@ export function adapterFor(db: Database.Database, tenantId: string, accountId: s
 
 export async function refreshAccountProfile(db: Database.Database, tenantId: string, accountId: string): Promise<void> {
   requireAccount(db, tenantId, accountId, true);
-  const result = await adapterFor(db, tenantId, accountId).profile();
+  const adapter = adapterFor(db, tenantId, accountId);
+  const result = await adapter.profile();
+  if (result.userId === ownerId(db, tenantId)) {
+    db.prepare("UPDATE accounts SET telegramUserId=? WHERE tenantId=? AND accountId=?").run(result.userId, tenantId, accountId);
+    revokeOwnerAccounts(db, tenantId);
+    await adapter.close().catch(() => undefined);
+    adapters.delete(key(tenantId, accountId));
+    throw new Error(ownerAccountError);
+  }
   const row = db.prepare("SELECT telegramUserId FROM accounts WHERE tenantId=? AND accountId=?").get(tenantId, accountId) as { telegramUserId: number | null } | undefined;
   if (!row) throw new Error("account not found");
   if (row.telegramUserId && row.telegramUserId !== result.userId) {
@@ -74,8 +88,9 @@ export async function refreshAccountProfile(db: Database.Database, tenantId: str
 export async function loginStart(db: Database.Database, tenantId: string, phone: string, requestedAccountId?: string): Promise<{ accountId: string; sent: true }> {
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before login");
   const accountId = requestedAccountId ?? randomUUID();
-  const owned = db.prepare("SELECT tenantId, status FROM accounts WHERE accountId = ?").get(accountId) as { tenantId: string; status: string } | undefined;
+  const owned = db.prepare("SELECT tenantId, status, telegramUserId FROM accounts WHERE accountId = ?").get(accountId) as { tenantId: string; status: string; telegramUserId: number | null } | undefined;
   if (owned && owned.tenantId !== tenantId) throw new Error("account not found");
+  if (owned?.telegramUserId === ownerId(db, tenantId)) throw new Error(ownerAccountError);
   if (owned?.status === "active" || owned?.status === "limit_paused") throw new Error("account is already connected");
   if (Number((db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE tenantId = ? AND accountId != ? AND (status = 'active' OR status = 'connecting')").get(tenantId, accountId) as { n: number }).n) >= limitFor(db, tenantId, "accounts")) throw new Error("account limit reached");
   if (owned?.status === "connecting") await cancelLogin(db, tenantId, accountId);
@@ -118,6 +133,14 @@ export async function loginComplete(db: Database.Database, tenantId: string, acc
   if (row.loginPhone !== phone) throw new Error("phone number does not match this login");
   const adapter = adapterFor(db, tenantId, accountId);
   const result = await adapter.signIn(phone, row.phoneCodeHash, code, password);
+  if (result.userId === ownerId(db, tenantId)) {
+    await adapter.logout().catch(() => undefined);
+    adapters.delete(key(tenantId, accountId));
+    db.prepare("UPDATE accounts SET status='logged_out',session=NULL,loginPhone=NULL,phoneCodeHash=NULL,telegramUserId=?,updatedAt=? WHERE tenantId=? AND accountId=?")
+      .run(result.userId, now(), tenantId, accountId);
+    db.prepare("DELETE FROM accounts WHERE tenantId=? AND accountId=? AND phone IS NULL AND session IS NULL AND status='logged_out'").run(tenantId, accountId);
+    throw new Error(ownerAccountError);
+  }
   const duplicate = db.prepare("SELECT phone FROM accounts WHERE tenantId=? AND accountId!=? AND telegramUserId=? AND status IN ('active','limit_paused') LIMIT 1")
     .get(tenantId, accountId, result.userId) as { phone: string | null } | undefined;
   if (duplicate) {
@@ -159,8 +182,8 @@ export async function deleteAccount(db: Database.Database, tenantId: string, acc
 }
 
 export function canRestoreAccount(db: Database.Database, tenantId: string, accountId: string): boolean {
-  const row = db.prepare("SELECT status,phone,session FROM accounts WHERE tenantId=? AND accountId=?").get(tenantId, accountId) as { status: string; phone: string | null; session: string | null } | undefined;
-  return row?.status === "logged_out" && !!row.phone && !row.session && hasTdlibSession(accountId);
+  const row = db.prepare("SELECT status,phone,session,telegramUserId FROM accounts WHERE tenantId=? AND accountId=?").get(tenantId, accountId) as { status: string; phone: string | null; session: string | null; telegramUserId: number | null } | undefined;
+  return row?.status === "logged_out" && !!row.phone && !row.session && row.telegramUserId !== ownerId(db, tenantId) && hasTdlibSession(accountId);
 }
 
 export async function restoreAccount(db: Database.Database, tenantId: string, accountId: string): Promise<boolean> {
@@ -171,6 +194,7 @@ export async function restoreAccount(db: Database.Database, tenantId: string, ac
   try {
     const resumed = await adapter.resumeSession();
     if (!resumed) { await adapter.close(); adapters.delete(key(tenantId, accountId)); return false; }
+    if (resumed.userId === ownerId(db, tenantId)) throw new Error(ownerAccountError);
     const duplicate = db.prepare("SELECT 1 FROM accounts WHERE tenantId=? AND accountId!=? AND telegramUserId=? AND status IN ('active','limit_paused')")
       .get(tenantId, accountId, resumed.userId);
     if (duplicate) throw new Error("This Telegram account is already connected elsewhere in your account list.");

@@ -1,6 +1,8 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { PLAN_LIMITS } from "./services/plans.js";
+import { revokeOwnerAccounts } from "./services/limits.js";
 
 export const now = (): string => new Date().toISOString();
 
@@ -36,7 +38,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
   senderAccountId TEXT NOT NULL,
   message TEXT NOT NULL, messageEntities TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', intervalSeconds INTEGER NOT NULL,
   dailyLimit INTEGER NOT NULL DEFAULT 0, accountCooldownSeconds INTEGER NOT NULL DEFAULT 0,
-  groupCooldownSeconds INTEGER NOT NULL DEFAULT 0, nextRunAt TEXT, promoNextAt TEXT, inlineMode INTEGER NOT NULL DEFAULT 0, sourceChatId TEXT, sourceMessageId INTEGER, richMessage TEXT, contentKind TEXT NOT NULL DEFAULT 'legacy', createdAt TEXT NOT NULL,
+  groupCooldownSeconds INTEGER NOT NULL DEFAULT 0, nextRunAt TEXT, promoNextAt TEXT, inlineMode INTEGER NOT NULL DEFAULT 0, sourceChatId TEXT, sourceMessageId INTEGER, richMessage TEXT, richContent TEXT, inlineOptions TEXT, contentKind TEXT NOT NULL DEFAULT 'legacy', createdAt TEXT NOT NULL,
   updatedAt TEXT NOT NULL, FOREIGN KEY (tenantId) REFERENCES tenants(tenantId) ON DELETE CASCADE,
   FOREIGN KEY (tenantId, senderAccountId) REFERENCES accounts(tenantId, accountId)
 );
@@ -116,6 +118,8 @@ export function openDb(path: string): Database.Database {
   if (!campaignColumns.some((column) => column.name === "sourceChatId")) db.exec("ALTER TABLE campaigns ADD COLUMN sourceChatId TEXT");
   if (!campaignColumns.some((column) => column.name === "sourceMessageId")) db.exec("ALTER TABLE campaigns ADD COLUMN sourceMessageId INTEGER");
   if (!campaignColumns.some((column) => column.name === "richMessage")) db.exec("ALTER TABLE campaigns ADD COLUMN richMessage TEXT");
+  if (!campaignColumns.some((column) => column.name === "richContent")) db.exec("ALTER TABLE campaigns ADD COLUMN richContent TEXT");
+  if (!campaignColumns.some((column) => column.name === "inlineOptions")) db.exec("ALTER TABLE campaigns ADD COLUMN inlineOptions TEXT");
   if (!campaignColumns.some((column) => column.name === "contentKind")) db.exec("ALTER TABLE campaigns ADD COLUMN contentKind TEXT NOT NULL DEFAULT 'legacy'");
   db.exec("UPDATE campaigns SET contentKind='text',inlineMode=0 WHERE contentKind='legacy' AND inlineMode=1 AND richMessage IS NULL AND message!='[Telegram media or rich message]' AND tenantId IN (SELECT tenantId FROM localUsers)");
   const paymentColumns = db.prepare("PRAGMA table_info(planPayments)").all() as Array<{ name: string }>;
@@ -126,6 +130,10 @@ export function openDb(path: string): Database.Database {
   if (!paymentNames.has("expiresAt")) db.exec("ALTER TABLE planPayments ADD COLUMN expiresAt TEXT NOT NULL DEFAULT ''");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS planPayments_externalId ON planPayments(externalId) WHERE externalId IS NOT NULL");
   db.exec("UPDATE tenants SET productId = 'ads-standalone' WHERE productId = 'ads' AND tenantId IN (SELECT tenantId FROM localUsers)");
+  for (const tier of ["free", "starter", "pro", "business"])
+    db.prepare("UPDATE tenants SET tierCode=?,limits=?,updatedAt=? WHERE productId='ads-standalone' AND tenantId IN (SELECT tenantId FROM localUsers WHERE tierCode=?)")
+      .run(tier, JSON.stringify(PLAN_LIMITS[tier]), now(), tier);
+  revokeOwnerAccounts(db);
   return db;
 }
 

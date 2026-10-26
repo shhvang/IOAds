@@ -12,8 +12,9 @@ import { tierLimits } from "./services/plans.js";
 import { enforceTenantLimits } from "./services/limits.js";
 import { paymentMethods, verifyPayment, type PaymentMethod } from "./payments.js";
 import { back, button, editRich, editRichAt, escapeHtml, menu, replyRich, type Button } from "./bot-ui.js";
+import { inlineResults, reusableRichMessage, withoutAttributionIcons } from "./inline.js";
 
-type Flow = { action: "phone" | "sending_code" | "code" | "password" | "verifying_code" | "campaign" | "payment"; accountId?: string; phone?: string; code?: string; tier?: string; method?: PaymentMethod; paymentId?: number };
+type Flow = { action: "phone" | "sending_code" | "code" | "password" | "verifying_code" | "campaign" | "payment"; accountId?: string; phone?: string; code?: string; tier?: string; method?: PaymentMethod; paymentId?: number; uiMessageId?: number };
 type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
 type CachedInlineMedia = WithoutId<Extract<InlineQueryResult, { type: "photo" | "video" | "document" | "gif" | "mpeg4_gif" | "audio" | "voice" | "sticker" }>>;
 
@@ -45,15 +46,16 @@ class PersistentFlows extends Map<number, Flow> {
   }
 }
 
-function cachedInlineMedia(msg: NonNullable<Context["message"]>): CachedInlineMedia | null {
+export function cachedInlineMedia(msg: NonNullable<Context["message"]>): CachedInlineMedia | null {
   const caption = msg.caption;
   const caption_entities = msg.caption_entities;
-  if (msg.photo?.length) return { type: "photo", photo_file_id: msg.photo.at(-1)!.file_id, caption, caption_entities };
-  if (msg.video) return { type: "video", video_file_id: msg.video.file_id, title: msg.caption?.slice(0, 80) || "Campaign video", caption, caption_entities };
-  if (msg.document) return { type: "document", document_file_id: msg.document.file_id, title: msg.document.file_name || "Campaign document", caption, caption_entities };
+  const show_caption_above_media = msg.show_caption_above_media;
+  if (msg.photo?.length) return { type: "photo", photo_file_id: msg.photo.at(-1)!.file_id, caption, caption_entities, show_caption_above_media };
+  if (msg.video) return { type: "video", video_file_id: msg.video.file_id, title: msg.caption?.slice(0, 80) || "Campaign video", caption, caption_entities, show_caption_above_media };
   if (msg.animation) return msg.animation.mime_type === "image/gif"
-    ? { type: "gif", gif_file_id: msg.animation.file_id, caption, caption_entities }
-    : { type: "mpeg4_gif", mpeg4_file_id: msg.animation.file_id, caption, caption_entities };
+    ? { type: "gif", gif_file_id: msg.animation.file_id, caption, caption_entities, show_caption_above_media }
+    : { type: "mpeg4_gif", mpeg4_file_id: msg.animation.file_id, caption, caption_entities, show_caption_above_media };
+  if (msg.document) return { type: "document", document_file_id: msg.document.file_id, title: msg.document.file_name || "Campaign document", caption, caption_entities };
   if (msg.audio) return { type: "audio", audio_file_id: msg.audio.file_id, caption, caption_entities };
   if (msg.voice) return { type: "voice", voice_file_id: msg.voice.file_id, title: "Campaign voice message", caption, caption_entities };
   if (msg.sticker) return { type: "sticker", sticker_file_id: msg.sticker.file_id };
@@ -87,6 +89,28 @@ export function startAdsBot(db: Database.Database): void {
   ]);
   
   const flows = new PersistentFlows(db);
+  const showFlowPrompt = async (ctx: Context, flow: Flow, content: string, options: Parameters<typeof editRich>[2] = {}) => {
+    const result = await editRich(ctx, content, options);
+    flow.uiMessageId = typeof result === "object" && "message_id" in result ? result.message_id : ctx.callbackQuery?.message?.message_id;
+    flows.set(ctx.from!.id, flow);
+  };
+  const flowRich = async (ctx: Context, flow: Flow | undefined, content: string, options: Parameters<typeof replyRich>[2] = {}): Promise<number> => {
+    if (flow?.uiMessageId) {
+      try {
+        await editRichAt(ctx, flow.uiMessageId, content, options);
+        return flow.uiMessageId;
+      } catch (error) {
+        if (/message is not modified/i.test(String(error))) return flow.uiMessageId;
+        if (!/message to edit not found|message can't be edited|there is no text|message is not a text message/i.test(String(error))) throw error;
+      }
+    }
+    const sent = await replyRich(ctx, content, options);
+    if (flow && ctx.from && flows.get(ctx.from.id) === flow) {
+      flow.uiMessageId = sent.message_id;
+      flows.set(ctx.from.id, flow);
+    }
+    return sent.message_id;
+  };
   setInterval(() => flows.sweep(), 60_000).unref();
   const membership = new Map<number, { allowed: boolean; expires: number }>();
   const tenantId = (userId: number): string => {
@@ -116,7 +140,7 @@ export function startAdsBot(db: Database.Database): void {
     else await replyRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(primary) });
   };
   bot.use(async (ctx, next) => {
-    if (ctx.chatMember) { await next(); return; }
+    if (ctx.chatMember || ctx.inlineQuery) { await next(); return; }
     const flow = ctx.from ? flows.get(ctx.from.id) : undefined;
     if (ctx.callbackQuery && flow && ["phone", "sending_code", "code", "password", "verifying_code"].includes(flow.action)
       && ctx.callbackQuery.data !== "login:cancel") {
@@ -131,13 +155,13 @@ export function startAdsBot(db: Database.Database): void {
          if (member.status === "left" || member.status === "kicked" || (member.status === "restricted" && !member.is_member)) {
           membership.set(ctx.from.id, { allowed: false, expires: Date.now() + 30_000 });
           db.prepare("UPDATE localUsers SET forceJoined = 0, updatedAt = ? WHERE telegramId = ?").run(now(), ctx.from.id);
-          await replyRich(ctx, "Join @iobuysell to use your userbots.", { reply_markup: menu([[{ text: "Join", url: "https://t.me/iobuysell" }], [button("Check", "home")]]) });
+          await editRich(ctx, "Join @iobuysell to use your userbots.", { reply_markup: menu([[{ text: "Join", url: "https://t.me/iobuysell" }], [button("Check", "home")]]) });
           return;
         }
         membership.set(ctx.from.id, { allowed: true, expires: Date.now() + 60_000 });
         db.prepare("UPDATE localUsers SET forceJoined = 1, updatedAt = ? WHERE telegramId = ?").run(now(), ctx.from.id);
       } catch {
-         await replyRich(ctx, "I can’t verify your @iobuysell membership yet. Open the group, then try again.", { reply_markup: menu([[{ text: "Open", url: "https://t.me/iobuysell" }]]) });
+         await editRich(ctx, "I can’t verify your @iobuysell membership yet. Open the group, then try again.", { reply_markup: menu([[{ text: "Open", url: "https://t.me/iobuysell" }]]) });
         return;
       }
     }
@@ -233,8 +257,7 @@ export function startAdsBot(db: Database.Database): void {
     const account = accounts(db, tenantId(ctx.from.id)).find((item) => item.accountId === accountId && item.status === "logged_out" && item.phone);
     await ctx.answerCallbackQuery();
     if (!account) return showAccount(ctx, accountId);
-    flows.set(ctx.from.id, { action: "phone", accountId });
-    await replyRich(ctx, `<h2>Reconnect ${escapeHtml(account.phone)}</h2><p>Send this account’s phone number again with its country code. Telegram will send a new login code. Reconnecting keeps your existing campaigns linked to this account.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("login:cancel", "Back to account")]]) });
+    await showFlowPrompt(ctx, { action: "phone", accountId }, `<h2>Reconnect ${escapeHtml(account.phone)}</h2><p>Send this account’s phone number again with its country code. Telegram will send a new login code. Reconnecting keeps your existing campaigns linked to this account.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("login:cancel", "Back to account")]]) });
   });
   bot.callbackQuery(/^restore:(.+)$/, async (ctx) => {
     const accountId = ctx.match[1]!;
@@ -278,11 +301,10 @@ export function startAdsBot(db: Database.Database): void {
   bot.callbackQuery("connect", async (ctx) => {
     await ctx.answerCallbackQuery();
     if (["phone", "sending_code", "code", "password", "verifying_code"].includes(flows.get(ctx.from.id)?.action ?? "")) {
-      await replyRich(ctx, "A login is already in progress. Finish it or cancel it before starting another account.", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
+      await editRich(ctx, "A login is already in progress. Finish it or cancel it before starting another account.", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
       return;
     }
-    flows.set(ctx.from.id, { action: "phone" });
-    await replyRich(ctx, `<h2>Connect an account</h2><p><b>Step 1 of 3 · Phone number</b><br/>Send the number with country code, for example <code>+1234567890</code>.</p><p>Telegram will send a code next. If the account uses two-step verification, I will ask for its password after that. Your session is encrypted on this service.</p>`, { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
+    await showFlowPrompt(ctx, { action: "phone" }, `<h2>Connect an account</h2><p><b>Step 1 of 3 · Phone number</b><br/>Send a different Telegram account’s number with country code, for example <code>+1234567890</code>. The account operating this bot cannot also be a sender.</p><p>Telegram will send a code next. If the account uses two-step verification, I will ask for its password after that. Your session is encrypted on this service.</p>`, { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
   });
   bot.callbackQuery("login:cancel", async (ctx) => {
     const flow = flows.get(ctx.from.id);
@@ -310,22 +332,18 @@ export function startAdsBot(db: Database.Database): void {
   });
   bot.callbackQuery(/^campaigns:(\d+)$/, async (ctx) => { await ctx.answerCallbackQuery(); await showCampaigns(ctx, Number(ctx.match[1])); });
   bot.inlineQuery(/.*/, async (ctx) => {
-    const user = db.prepare("SELECT tenantId FROM localUsers WHERE telegramId = ? AND forceJoined = 1").get(ctx.from.id) as { tenantId: string } | undefined;
-    const campaignId = /^campaign:(\d+)$/.exec(ctx.inlineQuery.query)?.[1];
-    const campaigns = (campaignId
-      ? db.prepare(`SELECT c.id, c.name, c.message, c.messageEntities, c.richMessage FROM campaigns c
-          WHERE c.id = ? AND ((? IS NOT NULL AND c.tenantId = ? AND ? = 1) OR EXISTS (SELECT 1 FROM campaignTargets ct JOIN accounts a ON a.tenantId=ct.tenantId AND a.accountId=ct.accountId WHERE ct.campaignId=c.id AND ct.tenantId=c.tenantId AND a.telegramUserId = ?))`)
-        .all(Number(campaignId), user?.tenantId ?? null, user?.tenantId ?? null, user ? 1 : 0, ctx.from.id)
-      : user
-        ? db.prepare("SELECT id, name, message, messageEntities, richMessage FROM campaigns WHERE tenantId = ? AND status IN ('draft','scheduled','paused') ORDER BY id DESC LIMIT 20").all(user.tenantId)
-        : []) as Array<{ id: number; name: string; message: string; messageEntities: string; richMessage: string | null }>;
-    const results: InlineQueryResult[] = campaigns.map((campaign) => {
-      const media = campaign.richMessage ? JSON.parse(campaign.richMessage) as CachedInlineMedia : null;
-      return media && ["photo", "video", "document", "gif", "mpeg4_gif", "audio", "voice", "sticker"].includes(media.type)
-        ? { ...media, id: String(campaign.id) } as InlineQueryResult
-        : { type: "article", id: String(campaign.id), title: campaign.name, description: campaign.message.slice(0, 100), input_message_content: { message_text: campaign.message, entities: JSON.parse(campaign.messageEntities) } };
-    });
-    await ctx.answerInlineQuery(results, { cache_time: 0, is_personal: true });
+    const query = ctx.inlineQuery.query;
+    const results = inlineResults(db, ctx.from.id, query, config.botUsername);
+    const options = {
+      cache_time: 0, is_personal: true,
+      ...(!/^campaign:\d+$/.test(query) ? { button: { text: "Open IOAds in private chat", start_parameter: "inline" } } : {}),
+    };
+    try {
+      await ctx.answerInlineQuery(results, options);
+    } catch (error) {
+      if (!/button_icon|custom emoji|icon_custom_emoji_id|fragment|premium/i.test(String(error))) throw error;
+      await ctx.answerInlineQuery(withoutAttributionIcons(results), options);
+    }
   });
   bot.callbackQuery("newcampaign", async (ctx) => {
     const tid = tenantId(ctx.from.id);
@@ -339,42 +357,41 @@ export function startAdsBot(db: Database.Database): void {
       return editRich(ctx, draft ? "You already have a draft. Select its groups and schedule it here." : "Your plan’s campaign limit is full. Open a campaign to manage it.", { reply_markup: menu([[button(draft ? "Open draft" : "Campaigns", draft ? `campaign:${draft.id}` : "campaigns", "primary")], [back("campaigns", "Back to campaigns")]]) });
     }
     if (list.length > 1) return editRich(ctx, `<h2>New campaign</h2><p>Choose an account to begin. After forwarding your post, you can add other accounts and choose different groups for each one.</p>`, { parse_mode: "HTML", reply_markup: menu([...list.map((account) => [button(accountButtonLabel(account), `campaignfrom:${account.accountId}`)]), [back("newcampaign:back", "Back to campaigns")]]) });
-    flows.set(ctx.from.id, { action: "campaign", accountId: list[0]!.accountId });
-    await editRich(ctx, `<h2>Send your post</h2><p>Forward the ad here. Text, formatting, and supported media will be kept.</p><p>Next you will choose groups and review the schedule before starting.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign:back", "Back to campaigns")]]) });
+    await showFlowPrompt(ctx, { action: "campaign", accountId: list[0]!.accountId }, `<h2>Send your post</h2><p>Forward the ad here. Text, formatting, and supported media will be kept.</p><p>Next you will choose groups and review the schedule before starting.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign:back", "Back to campaigns")]]) });
   });
   bot.callbackQuery(/^campaignfrom:([^:]+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const account = accounts(db, tenantId(ctx.from.id)).find((item) => item.accountId === ctx.match[1] && item.status === "active");
     if (!account) return editRich(ctx, "That account is unavailable. Choose another account.", { reply_markup: menu([[back("newcampaign", "Back to account choice")]]) });
-    flows.set(ctx.from.id, { action: "campaign", accountId: account.accountId });
-    await editRich(ctx, `<h2>Send your post</h2><p><b>Starting with:</b> ${escapeHtml(accountLabel(account))}</p><p>Forward the ad here. Then choose groups for this account, add any other accounts, and review the schedule.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign", "Back to account choice")]]) });
+    await showFlowPrompt(ctx, { action: "campaign", accountId: account.accountId }, `<h2>Send your post</h2><p><b>Starting with:</b> ${escapeHtml(accountLabel(account))}</p><p>Forward the ad here. Then choose groups for this account, add any other accounts, and review the schedule.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign", "Back to account choice")]]) });
   });
   bot.callbackQuery("newcampaign:back", async (ctx) => { flows.delete(ctx.from.id); await ctx.answerCallbackQuery(); await showCampaigns(ctx); });
   const showCampaign = async (ctx: Context, id: number) => {
     const campaign = db.prepare("SELECT name, status, intervalSeconds FROM campaigns WHERE tenantId = ? AND id = ?").get(tenantId(ctx.from!.id), id) as { name: string; status: string; intervalSeconds: number } | undefined;
-    if (!campaign) return replyRich(ctx, "Campaign not found.", { reply_markup: menu([[back("campaigns", "Back to campaigns")]]) });
+    if (!campaign) return editRich(ctx, "Campaign not found.", { reply_markup: menu([[back("campaigns", "Back to campaigns")]]) });
     const action = campaign.status === "scheduled" ? "pause" : "schedule";
     const tid = tenantId(ctx.from!.id);
-    const inline = db.prepare("SELECT inlineMode,contentKind,messageEntities FROM campaigns WHERE tenantId = ? AND id = ?").get(tid, id) as { inlineMode: number; contentKind: string; messageEntities: string };
-    const hasCustomEmoji = (JSON.parse(inline.messageEntities || "[]") as Array<{ type: string }>).some((entity) => entity.type === "custom_emoji");
+    const inline = db.prepare("SELECT inlineMode,contentKind,richMessage,richContent,inlineOptions FROM campaigns WHERE tenantId = ? AND id = ?").get(tid, id) as { inlineMode: number; contentKind: string; richMessage: string | null; richContent: string | null; inlineOptions: string | null };
     const targets = (db.prepare(`SELECT COUNT(*) AS count FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId JOIN accounts a ON a.tenantId=ct.tenantId AND a.accountId=ct.accountId WHERE ct.tenantId=? AND ct.campaignId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' AND a.status='active' AND a.session IS NOT NULL`).get(tid, id) as { count: number }).count;
     const rows: Button[][] = [
       [button(`Accounts & groups · ${targets} selected`, `campaignaccounts:${id}`, "primary")],
       [button(`${campaign.intervalSeconds === 300 ? "✓ " : ""}5 min`, `interval:${id}:300`), button(`${campaign.intervalSeconds === 1800 ? "✓ " : ""}30 min`, `interval:${id}:1800`), button(`${campaign.intervalSeconds === 3600 ? "✓ " : ""}60 min`, `interval:${id}:3600`)],
     ];
-    if (config.botUsername && inline.contentKind !== "text" && !hasCustomEmoji && !['free', 'starter'].includes((db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from!.id) as { tierCode: string }).tierCode)) rows.push([button(`Posting: ${inline.inlineMode ? "inline" : "direct"} · change`, `inline:${id}`)]);
+    const hasMediaSpoiler = inline.inlineOptions ? (JSON.parse(inline.inlineOptions) as { has_media_spoiler?: boolean }).has_media_spoiler : false;
+    const canInline = !hasMediaSpoiler && (inline.contentKind === "text" || !!inline.richContent || !!(inline.richMessage && inline.inlineOptions));
+    if (config.botUsername && canInline) rows.push([button(`Posting: ${inline.inlineMode ? "inline" : "direct"} · change`, `inline:${id}`)]);
     rows.push([button(action === "pause" ? "Pause campaign" : "Start campaign", `setcampaign:${id}:${action}`, action === "pause" ? "danger" : "success")]);
     if (campaign.status !== "cancelled") rows.push([button("Cancel campaign", `confirmcancel:${id}`, "link")]);
     else rows.push([button("Delete campaign", `confirmdeletecampaign:${id}`, "danger", "trash")]);
     rows.push([back("campaigns", "Back to campaigns")]);
     const keyboard = menu(rows);
-    await editRich(ctx, `<h2>${escapeHtml(campaign.name)}</h2><p><b>Status:</b> ${campaign.status}<br/><b>Groups:</b> ${targets} ready<br/><b>Frequency:</b> every ${campaign.intervalSeconds / 60} minutes<br/><b>Posting:</b> ${inline.contentKind === "text" ? "connected account" : inline.inlineMode && !hasCustomEmoji ? "inline via connected account" : "connected account copy"}</p><p>${!targets ? "Choose at least one group to start." : campaign.status === "scheduled" ? "This campaign is running. You can pause it or change its groups and frequency." : campaign.status === "cancelled" ? "Stopped. You can start it again." : "Ready to start. The first delivery will be queued when you start it."}</p>`, { parse_mode: "HTML", reply_markup: keyboard });
+    await editRich(ctx, `<h2>${escapeHtml(campaign.name)}</h2><p><b>Status:</b> ${campaign.status}<br/><b>Groups:</b> ${targets} ready<br/><b>Frequency:</b> every ${campaign.intervalSeconds / 60} minutes<br/><b>Posting:</b> ${inline.inlineMode ? "inline via connected account" : inline.contentKind === "text" ? "connected account" : "connected account copy"}</p><p>${!targets ? "Choose at least one group to start." : campaign.status === "scheduled" ? "This campaign is running. You can pause it or change its groups and frequency." : campaign.status === "cancelled" ? "Stopped. You can start it again." : "Ready to start. The first delivery will be queued when you start it."}</p>`, { parse_mode: "HTML", reply_markup: keyboard });
   };
   bot.callbackQuery(/^campaign:(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     await showCampaign(ctx, Number(ctx.match[1]));
   });
-  const showCampaignAccounts = async (ctx: Context, id: number, requestedPage = 0) => {
+  const showCampaignAccounts = async (ctx: Context, id: number, requestedPage = 0, flow?: Flow) => {
     const tid = tenantId(ctx.from!.id);
     if (!db.prepare("SELECT 1 FROM campaigns WHERE tenantId=? AND id=?").get(tid, id)) throw new Error("Campaign not found.");
     const list = db.prepare(`SELECT a.rowid AS accountRowId,a.accountId,a.phone,a.displayName,a.status,COUNT(ct.chatId) AS selected
@@ -386,7 +403,9 @@ export function startAdsBot(db: Database.Database): void {
     if (list.length > pageSize) rows.push([...(page ? [button("Previous", `campaignaccounts:${id}:${page - 1}`, undefined, "prev")] : []), ...(page < Math.ceil(list.length / pageSize) - 1 ? [button("Next", `campaignaccounts:${id}:${page + 1}`, undefined, "next")] : [])]);
     rows.push([back(`campaign:${id}`, "Back to campaign")]);
     const summary = visible.map((item) => `<li><b>${escapeHtml(item.displayName || "Telegram account")}</b>${item.phone ? ` · ${escapeHtml(item.phone)}` : ""} · ${item.selected} selected${item.status === "active" ? "" : " · disconnected"}</li>`).join("");
-    await editRich(ctx, `<h2>Accounts & groups</h2><p>Choose each account that should post this campaign. Each account has its own group selection, so the same campaign can reach different groups from different accounts.</p>${summary ? `<ul>${summary}</ul>` : "<p>Connect an account to choose groups.</p>"}`, { parse_mode: "HTML", reply_markup: menu(rows) });
+    const content = `<h2>Accounts & groups</h2><p>Choose each account that should post this campaign. Each account has its own group selection, so the same campaign can reach different groups from different accounts.</p>${summary ? `<ul>${summary}</ul>` : "<p>Connect an account to choose groups.</p>"}`;
+    if (flow) await flowRich(ctx, flow, content, { parse_mode: "HTML", reply_markup: menu(rows) });
+    else await editRich(ctx, content, { parse_mode: "HTML", reply_markup: menu(rows) });
   };
   bot.callbackQuery(/^campaignaccounts:(\d+)(?::(\d+))?$/, async (ctx) => { await ctx.answerCallbackQuery(); await showCampaignAccounts(ctx, Number(ctx.match[1]), Number(ctx.match[2] ?? 0)); });
   bot.callbackQuery(/^ca:(\d+):(\d+)$/, async (ctx) => { await ctx.answerCallbackQuery(); const account = db.prepare("SELECT accountId FROM accounts WHERE rowid=? AND tenantId=?").get(Number(ctx.match[2]), tenantId(ctx.from.id)) as { accountId: string } | undefined; if (!account) return showCampaignAccounts(ctx, Number(ctx.match[1])); await showCampaignTargets(ctx, Number(ctx.match[1]), account.accountId); });
@@ -416,7 +435,7 @@ export function startAdsBot(db: Database.Database): void {
   bot.callbackQuery(/^campaigntargets:(\d+)(?::(\d+))?$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     try { await showCampaignAccounts(ctx, Number(ctx.match[1])); }
-    catch (error) { await replyRich(ctx, String(error instanceof Error ? error.message : error), { reply_markup: menu([[back(`campaign:${ctx.match[1]}`, "Back to campaign")]]) }); }
+    catch (error) { await editRich(ctx, String(error instanceof Error ? error.message : error), { reply_markup: menu([[back(`campaign:${ctx.match[1]}`, "Back to campaign")]]) }); }
   });
   const campaignAccountByRow = (ctx: Context, rowId: number): string => {
     const row = db.prepare("SELECT accountId FROM accounts WHERE tenantId=? AND rowid=?").get(tenantId(ctx.from!.id), rowId) as { accountId: string } | undefined;
@@ -468,10 +487,10 @@ export function startAdsBot(db: Database.Database): void {
     await ctx.answerCallbackQuery("Refreshing groups");
     const tid = tenantId(ctx.from.id), id = Number(ctx.match[1]);
     const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tid, id) as { senderAccountId: string } | undefined;
-    if (!campaign) return replyRich(ctx, "Campaign not found.", { reply_markup: menu([[back("campaigns", "Back to campaigns")]]) });
+    if (!campaign) return editRich(ctx, "Campaign not found.", { reply_markup: menu([[back("campaigns", "Back to campaigns")]]) });
     await editRich(ctx, "Refreshing groups from your connected account…", { reply_markup: menu([[back(`campaign:${id}`, "Back to campaign")]]) });
     try { await syncGroups(db, tid, campaign.senderAccountId); await showCampaignTargets(ctx, id, campaign.senderAccountId, Number(ctx.match[2] ?? 0)); }
-    catch (error) { await replyRich(ctx, `Could not refresh groups: ${String(error instanceof Error ? error.message : error)}`, { reply_markup: menu([[back(`campaign:${id}`, "Back to campaign")]]) }); }
+    catch (error) { await editRich(ctx, `Could not refresh groups: ${String(error instanceof Error ? error.message : error)}`, { reply_markup: menu([[back(`campaign:${id}`, "Back to campaign")]]) }); }
   });
   bot.callbackQuery(/^interval:(\d+):(300|1800|3600)$/, async (ctx) => {
     const [, id, seconds] = ctx.match;
@@ -481,13 +500,14 @@ export function startAdsBot(db: Database.Database): void {
   });
   bot.callbackQuery(/^inline:(\d+)$/, async (ctx) => {
     if (!config.botUsername) return ctx.answerCallbackQuery({ text: "Inline delivery is not configured.", show_alert: true });
-    const campaign = db.prepare("SELECT contentKind,messageEntities FROM campaigns WHERE tenantId=? AND id=?").get(tenantId(ctx.from.id), Number(ctx.match[1])) as { contentKind: string; messageEntities: string } | undefined;
-    if (!campaign || campaign.contentKind === "text") return ctx.answerCallbackQuery({ text: "Text campaigns use the connected account directly.", show_alert: true });
-    if ((JSON.parse(campaign.messageEntities || "[]") as Array<{ type: string }>).some((entity) => entity.type === "custom_emoji"))
-      return ctx.answerCallbackQuery({ text: "Custom emoji captions need a direct copy from a Premium connected account.", show_alert: true });
-    const tier = (db.prepare("SELECT tierCode FROM localUsers WHERE telegramId=?").get(ctx.from.id) as { tierCode: string }).tierCode;
-    if (tier === "free" || tier === "starter") return ctx.answerCallbackQuery({ text: "This setting is available on paid plans.", show_alert: true });
     const id = Number(ctx.match[1]);
+    const campaign = db.prepare("SELECT inlineMode,contentKind,sourceChatId,richMessage,richContent,inlineOptions FROM campaigns WHERE tenantId=? AND id=?").get(tenantId(ctx.from.id), id) as { inlineMode: number; contentKind: string; sourceChatId: string | null; richMessage: string | null; richContent: string | null; inlineOptions: string | null } | undefined;
+    if (!campaign) return ctx.answerCallbackQuery({ text: "Campaign unavailable.", show_alert: true });
+    const options = campaign.inlineOptions ? JSON.parse(campaign.inlineOptions) as { reply_markup?: unknown; link_preview_options?: unknown; has_media_spoiler?: boolean } : {};
+    if (!campaign.inlineMode && (options.has_media_spoiler || !(campaign.contentKind === "text" || campaign.richContent || (campaign.richMessage && campaign.inlineOptions))))
+      return ctx.answerCallbackQuery({ text: "This post cannot be sent intact through inline mode.", show_alert: true });
+    if (campaign.inlineMode && !campaign.sourceChatId && (campaign.contentKind !== "text" || options.reply_markup || options.link_preview_options))
+      return ctx.answerCallbackQuery({ text: "Direct posting needs ADS_ARCHIVE_CHAT to keep this post intact.", show_alert: true });
     db.prepare("UPDATE campaigns SET inlineMode = 1 - inlineMode, updatedAt = ? WHERE tenantId = ? AND id = ?").run(now(), tenantId(ctx.from.id), id);
     await ctx.answerCallbackQuery("Posting method updated");
     await showCampaign(ctx, id);
@@ -506,7 +526,7 @@ export function startAdsBot(db: Database.Database): void {
     const id = Number(ctx.match[1]);
     const campaign = db.prepare("SELECT name FROM campaigns WHERE tenantId=? AND id=?").get(tenantId(ctx.from.id), id) as { name: string } | undefined;
     await ctx.answerCallbackQuery();
-    if (!campaign) return replyRich(ctx, "Campaign not found.", { reply_markup: menu([[back("campaigns", "Back to campaigns")]]) });
+    if (!campaign) return editRich(ctx, "Campaign not found.", { reply_markup: menu([[back("campaigns", "Back to campaigns")]]) });
     await editRich(ctx, `<h2>Stop campaign?</h2><p><b>${escapeHtml(campaign.name)}</b> will stop sending and pending deliveries will be skipped. You can start it again later.</p>`, { parse_mode: "HTML", reply_markup: menu([[button("Stop campaign", `setcampaign:${id}:cancel`, "danger", "cross")], [back(`campaign:${id}`, "Back to campaign")]]) });
   });
   bot.callbackQuery(/^confirmdeletecampaign:(\d+)$/, async (ctx) => {
@@ -577,7 +597,7 @@ export function startAdsBot(db: Database.Database): void {
     const row = db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { tierCode: string };
     const expires = db.prepare("SELECT paidUntil FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { paidUntil: string | null };
     const rows = [[button("Choose Pro · $1/mo", "upgrade:pro", "primary", "card")], [button("Choose Business · $3/mo", "upgrade:business", undefined, "card")], [back("home", "Back to home")]];
-    await editRich(ctx, `<h2>Your plan · ${escapeHtml(row.tierCode)}</h2><p>${expires.paidUntil ? `Active until ${new Date(expires.paidUntil).toLocaleDateString()}.` : "Choose a plan when you need more accounts or daily sends."}</p><table compact><tr><th>Plan</th><th>Accounts</th><th>Daily sends</th></tr><tr><td>Free</td><td>1</td><td>500</td></tr><tr><td>Pro</td><td>5</td><td>2,000</td></tr><tr><td>Business</td><td>15</td><td>10,000</td></tr></table><p>Payments are checked automatically after you send a transaction ID.</p>`, { parse_mode: "HTML", reply_markup: menu(rows) });
+    await editRich(ctx, `<h2>Your plan · ${escapeHtml(row.tierCode)}</h2><p>${expires.paidUntil ? `Active until ${new Date(expires.paidUntil).toLocaleDateString()}.` : "Choose a plan when you need more accounts or daily sends."}</p><table compact><tr><th>Plan</th><th>Accounts</th><th>Daily sends</th></tr>${([['Free', 'free'], ['Pro', 'pro'], ['Business', 'business']] as const).map(([label, tier]) => `<tr><td>${label}</td><td>${tierLimits(tier).accounts}</td><td>${tierLimits(tier).dailyMessages.toLocaleString()}</td></tr>`).join("")}</table><p>Payments are checked automatically after you send a transaction ID.</p>`, { parse_mode: "HTML", reply_markup: menu(rows) });
   });
   bot.callbackQuery(/^upgrade:(pro|business)$/, async (ctx) => {
     flows.delete(ctx.from.id);
@@ -590,7 +610,7 @@ export function startAdsBot(db: Database.Database): void {
     const rows = available.map((method) => [button(method === "Binance" ? "Binance" : method, `pay:${tier}:${method}`)]);
     rows.push([back("plan", "Back to plan")]);
     const keyboard = menu(rows);
-    await replyRich(ctx, `<b>${tier} · $${monthly}/month</b>\nChoose a payment method. Access begins after the transfer is verified.`, { parse_mode: "HTML", reply_markup: keyboard });
+    await editRich(ctx, `<b>${tier} · $${monthly}/month</b>\nChoose a payment method. Access begins after the transfer is verified.`, { parse_mode: "HTML", reply_markup: keyboard });
   });
   bot.callbackQuery(/^pay:(pro|business):(Binance|BEP20|TRC20)$/, async (ctx) => {
     const tier = ctx.match[1]!, method = ctx.match[2] as PaymentMethod;
@@ -600,9 +620,8 @@ export function startAdsBot(db: Database.Database): void {
     const reference = `ads:${ctx.from.id}:${Date.now()}`;
     const timestamp = now(), expiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
     const id = Number(db.prepare("INSERT INTO planPayments (telegramId, tierCode, network, amount, reference, createdAt, expiresAt) VALUES (?, ?, ?, ?, ?, ?, ?)").run(ctx.from.id, tier, method, amount, reference, timestamp, expiresAt).lastInsertRowid);
-    flows.set(ctx.from.id, { action: "payment", tier, method, paymentId: id });
     await ctx.answerCallbackQuery();
-      await replyRich(ctx, `<b>Pay $${amount} · ${method}</b>\n\n${address}\n\n${method === "Binance" ? "Send USDT with Binance Pay." : "Send USDT on the selected network."}\nThen send the Order ID or transaction hash here. This request expires in 30 minutes.`, { parse_mode: "HTML", reply_markup: menu([[back(`upgrade:${tier}`, "Back to payment methods")]]) });
+    await showFlowPrompt(ctx, { action: "payment", tier, method, paymentId: id }, `<b>Pay $${amount} · ${method}</b>\n\n${address}\n\n${method === "Binance" ? "Send USDT with Binance Pay." : "Send USDT on the selected network."}\nThen send the Order ID or transaction hash here. This request expires in 30 minutes.`, { parse_mode: "HTML", reply_markup: menu([[back(`upgrade:${tier}`, "Back to payment methods")]]) });
   });
   bot.callbackQuery("home", async (ctx) => { flows.delete(ctx.from.id); await ctx.answerCallbackQuery(); await showHome(ctx); });
   const toggleTarget = async (ctx: Context, campaignId: number, accountId: string, chatId: string, page: number) => {
@@ -644,26 +663,26 @@ export function startAdsBot(db: Database.Database): void {
     if (!flow) return next();
     if (flow.action === "campaign") return next();
     if (flow.action === "sending_code" || flow.action === "verifying_code") {
-      await replyRich(ctx, "Telegram is still processing the previous step. Please wait, or cancel this login.", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
+      await flowRich(ctx, flow, "Telegram is still processing the previous step. Please wait, or cancel this login.", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
       return;
     }
     try {
       if (flow.action === "phone") {
         const phone = ctx.message.text.trim();
         if (!/^\+[1-9]\d{6,14}$/.test(phone)) {
-          await replyRich(ctx, "Send a valid phone number in international format, such as <code>+1234567890</code>.", { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
+          await flowRich(ctx, flow, "Send a valid phone number in international format, such as <code>+1234567890</code>.", { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
           return;
         }
         if (flow.accountId) {
           const existing = accounts(db, tenantId(ctx.from.id)).find((account) => account.accountId === flow.accountId);
           if (existing?.phone && existing.phone !== phone) {
-            await replyRich(ctx, `Send the phone number already linked to this account: <code>${escapeHtml(existing.phone)}</code>.`, { parse_mode: "HTML", reply_markup: menu([[back("login:cancel", "Back to account")]]) });
+            await flowRich(ctx, flow, `Send the phone number already linked to this account: <code>${escapeHtml(existing.phone)}</code>.`, { parse_mode: "HTML", reply_markup: menu([[back("login:cancel", "Back to account")]]) });
             return;
           }
         }
-        const sendingFlow: Flow = { action: "sending_code", accountId: flow.accountId ?? randomUUID(), phone };
+        const sendingFlow: Flow = { action: "sending_code", accountId: flow.accountId ?? randomUUID(), phone, uiMessageId: flow.uiMessageId };
         flows.set(ctx.from.id, sendingFlow);
-        const progress = await replyRich(ctx, "Connecting to Telegram", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
+        const progress = await flowRich(ctx, sendingFlow, "Connecting to Telegram", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
         const action = setInterval(() => void ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => undefined), 4_000);
         try {
           await ctx.api.sendChatAction(ctx.chat.id, "typing");
@@ -672,8 +691,8 @@ export function startAdsBot(db: Database.Database): void {
             await cancelLogin(db, tenantId(ctx.from.id), result.accountId);
             return;
           }
-          flows.set(ctx.from.id, { action: "code", accountId: result.accountId, phone });
-           await editRichAt(ctx, progress.message_id, `✅ <b>Code sent</b>\n\nTelegram sent a login code to <code>${escapeHtml(phone)}</code>. Check the account's Telegram app or SMS.\n\n⚠️ <b>If this is your current account:</b> Send the code with spaces between digits (e.g., <code>1 2 3 4 5</code>) to prevent auto-fill.\n\n<b>Otherwise:</b> Send the code normally (e.g., <code>12345</code>).`, { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
+          flows.set(ctx.from.id, { action: "code", accountId: result.accountId, phone, uiMessageId: progress });
+          await editRichAt(ctx, progress, `✅ <b>Code sent</b>\n\nTelegram sent a login code to <code>${escapeHtml(phone)}</code>. Check that account's Telegram app or SMS, then send the code here. This must be a different account from the one operating this bot.`, { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
         } finally {
           clearInterval(action);
         }
@@ -683,33 +702,33 @@ export function startAdsBot(db: Database.Database): void {
         const code = flow.action === "password" ? flow.code : inputCode;
         const passwordValue = flow.action === "password" ? rawInput : undefined;
         if (flow.action === "code" && !/^\d{5,6}$/.test(inputCode)) {
-          await replyRich(ctx, "Send the 5 or 6 digit login code from Telegram.\n\n💡 Tip: You can send it with or without spaces (e.g., <code>12345</code> or <code>1 2 3 4 5</code>).", { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
+          await flowRich(ctx, flow, "Send the 5 or 6 digit login code from Telegram.\n\n💡 Tip: You can send it with or without spaces (e.g., <code>12345</code> or <code>1 2 3 4 5</code>).", { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
           return;
         }
         const verifyingFlow: Flow = { ...flow, action: "verifying_code" };
         flows.set(ctx.from.id, verifyingFlow);
-        const progress = await replyRich(ctx, "Verifying your login with Telegram", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
+        const progress = await flowRich(ctx, verifyingFlow, "Verifying your login with Telegram", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
         const action = setInterval(() => void ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => undefined), 4_000);
         try {
           await ctx.api.sendChatAction(ctx.chat.id, "typing");
           await loginComplete(db, tenantId(ctx.from.id), flow.accountId!, flow.phone!, code ?? "", passwordValue);
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           flows.delete(ctx.from.id);
-          await editRichAt(ctx, progress.message_id, "<b>Userbot connected</b>\nYou can now sync its groups and create a campaign.", { parse_mode: "HTML", reply_markup: home() });
+          await editRichAt(ctx, progress, "<b>Userbot connected</b>\nYou can now sync its groups and create a campaign.", { parse_mode: "HTML", reply_markup: home() });
         } catch (error) {
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           if (String(error).toUpperCase().includes("SESSION_PASSWORD_NEEDED") && flow.action === "code") {
             flows.set(ctx.from.id, { ...flow, action: "password", code: code! });
-             await editRichAt(ctx, progress.message_id, "🔐 <b>Two-step verification required</b>\n\nThis account has 2FA enabled. Send your cloud password (the one you set in Security settings, not the login code) to complete the connection.", { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
+            await editRichAt(ctx, progress, "🔐 <b>Two-step verification required</b>\n\nThis account has 2FA enabled. Send your cloud password (the one you set in Security settings, not the login code) to complete the connection.", { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
           } else if (flow.action === "password" && !flow.code && /PHONE_CODE_INVALID|not waiting for a login code/i.test(String(error))) {
             flows.set(ctx.from.id, { ...flow, action: "code" });
-            await editRichAt(ctx, progress.message_id, "The login session resumed after a restart. Send the Telegram code again, or cancel to request a new one.", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
-          } else if (String(error).toUpperCase().includes("ALREADY CONNECTED")) {
+            await editRichAt(ctx, progress, "The login session resumed after a restart. Send the Telegram code again, or cancel to request a new one.", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
+          } else if (String(error).toUpperCase().includes("ALREADY CONNECTED") || String(error).includes("account operating this bot")) {
             flows.delete(ctx.from.id);
-            await editRichAt(ctx, progress.message_id, `<b>Already connected</b><br/>${loginError(error)}`, { parse_mode: "HTML", reply_markup: menu([[back("accounts", "Back to accounts")]]) });
+            await editRichAt(ctx, progress, `<b>Account not connected</b><br/>${escapeHtml(String(error instanceof Error ? error.message : error))}`, { parse_mode: "HTML", reply_markup: menu([[back("accounts", "Back to accounts")]]) });
           } else {
             flows.set(ctx.from.id, { ...flow, action: flow.action === "password" ? "password" : "code", code: flow.action === "password" ? flow.code : code });
-             await editRichAt(ctx, progress.message_id, `❌ <b>Login failed</b>\n\n${loginError(error)}\n\nTry again or cancel to start over.`, { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
+            await editRichAt(ctx, progress, `❌ <b>Login failed</b>\n\n${loginError(error)}\n\nTry again or cancel to start over.`, { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
           }
         } finally {
           clearInterval(action);
@@ -718,7 +737,7 @@ export function startAdsBot(db: Database.Database): void {
         const payment = db.prepare("SELECT id, telegramId, tierCode, network, amount, createdAt, expiresAt, status FROM planPayments WHERE id = ?").get(flow.paymentId) as { id: number; telegramId: number; tierCode: string; network: PaymentMethod; amount: number; createdAt: string; expiresAt: string; status: string } | undefined;
         if (!payment || payment.status !== "pending" || payment.telegramId !== ctx.from.id || Date.parse(payment.expiresAt) <= Date.now()) throw new Error("Payment request expired. Start a new upgrade request.");
         const verified = await verifyPayment(payment.network, ctx.message.text.trim(), payment.createdAt, payment.amount);
-        if (!verified) return replyRich(ctx, "I couldn’t match that payment yet. Check the ID and try again after the transfer confirms.", { reply_markup: menu([[back(`upgrade:${payment.tierCode}`, "Back to payment methods")]]) });
+        if (!verified) return flowRich(ctx, flow, "I couldn’t match that payment yet. Check the ID and try again after the transfer confirms.", { reply_markup: menu([[back(`upgrade:${payment.tierCode}`, "Back to payment methods")]]) });
         const currentUntil = (db.prepare("SELECT paidUntil FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { paidUntil: string | null }).paidUntil;
         const paidUntil = new Date(Math.max(Date.now(), currentUntil ? Date.parse(currentUntil) : 0) + 30 * 86400_000).toISOString();
         try {
@@ -738,38 +757,52 @@ export function startAdsBot(db: Database.Database): void {
         flows.delete(ctx.from.id);
         const list = accounts(db, tenantId(ctx.from.id));
         const primary = list.some((item) => item.status === "active") ? "campaign" : list.some((item) => item.phone) ? "accounts" : "connect";
-        await replyRich(ctx, `${payment.tierCode} is active until ${new Date(paidUntil).toLocaleDateString()}.`, { reply_markup: home(primary) });
+        await flowRich(ctx, flow, `${payment.tierCode} is active until ${new Date(paidUntil).toLocaleDateString()}.`, { reply_markup: home(primary) });
       }
     } catch (error) {
       if (["phone", "sending_code"].includes(flows.get(ctx.from.id)?.action ?? "")) {
-        flows.set(ctx.from.id, { action: "phone" });
-         await replyRich(ctx, `Could not request a login code: ${loginError(error)}\nCheck the number and try again, or cancel the login.`, { reply_markup: menu([[loginBack(ctx.from.id)]]) });
+        const previous = flows.get(ctx.from.id);
+        const retryFlow: Flow = { action: "phone", accountId: previous?.accountId, uiMessageId: previous?.uiMessageId };
+        flows.set(ctx.from.id, retryFlow);
+        await flowRich(ctx, retryFlow, `Could not request a login code: ${loginError(error)}\nCheck the number and try again, or cancel the login.`, { reply_markup: menu([[loginBack(ctx.from.id)]]) });
       } else {
         const activeFlow = flows.get(ctx.from.id);
-        await replyRich(ctx, String(error instanceof Error ? error.message : error), { reply_markup: menu([[activeFlow?.action === "payment" && activeFlow.tier ? back(`upgrade:${activeFlow.tier}`, "Back to payment methods") : back("home", "Back to home")]]) });
+        await flowRich(ctx, activeFlow, String(error instanceof Error ? error.message : error), { reply_markup: menu([[activeFlow?.action === "payment" && activeFlow.tier ? back(`upgrade:${activeFlow.tier}`, "Back to payment methods") : back("home", "Back to home")]]) });
       }
     }
   });
   bot.on("message", async (ctx) => {
     const flow = flows.get(ctx.from.id);
     if (flow?.action !== "campaign") return;
+    let savedCampaignId: number | null = null;
     try {
       const msg = ctx.message;
-      const message = msg.text ?? msg.caption ?? "[Telegram media or rich message]";
+      if (msg.media_group_id) throw new Error("Telegram sends albums as separate updates. Send one post at a time so the campaign keeps the complete post.");
+      if (msg.reply_markup?.inline_keyboard.some((row) => row.some((item) => !("url" in item || "copy_text" in item))))
+        throw new Error("This post contains buttons tied to another bot. Use URL or copy buttons instead.");
+      const message = msg.text ?? msg.caption ?? (msg.rich_message ? "[Telegram rich message]" : "[Telegram media]");
       const tid = tenantId(ctx.from.id);
-      if (!msg.text && config.archiveChat.replace(/^@/, "").toLowerCase() === config.forceJoinChat.replace(/^@/, "").toLowerCase())
-        throw new Error("Media ads need a dedicated ADS_ARCHIVE_CHAT. It cannot be the public group.");
-      const archived = msg.text ? null : await ctx.api.copyMessage(config.archiveChat || ctx.from.id, msg.chat.id, msg.message_id);
-      const created = createCampaign(db, tid, { name: message.slice(0, 50), message, senderAccountId: flow.accountId!, intervalSeconds: 300 }) as { id: number };
+      const richContent = msg.rich_message ? reusableRichMessage(msg.rich_message) : null;
       const inlineMedia = cachedInlineMedia(msg);
+      const inlineSupported = !!(config.botUsername && !msg.has_media_spoiler && (richContent || msg.text || inlineMedia));
+      if (!inlineSupported && (!msg.text || msg.reply_markup || msg.link_preview_options) && !config.archiveChat)
+        throw new Error("This post needs ADS_ARCHIVE_CHAT to keep all content intact. Configure a dedicated archive chat and send it again.");
+      if (config.archiveChat && config.archiveChat.replace(/^@/, "").toLowerCase() === config.forceJoinChat.replace(/^@/, "").toLowerCase())
+        throw new Error("ADS_ARCHIVE_CHAT must be separate from the public group.");
+      const archived = config.archiveChat ? await ctx.api.copyMessage(config.archiveChat, msg.chat.id, msg.message_id) : null;
       const entities = msg.entities ?? msg.caption_entities ?? [];
-      const hasCustomEmoji = entities.some((entity) => entity.type === "custom_emoji");
-      db.prepare("UPDATE campaigns SET messageEntities = ?, sourceChatId = ?, sourceMessageId = ?, richMessage = ?, contentKind=?, inlineMode = ? WHERE id = ? AND tenantId = ?")
-        .run(JSON.stringify(entities), archived ? config.archiveChat || String(ctx.from.id) : null, archived?.message_id ?? null, inlineMedia ? JSON.stringify(inlineMedia) : null, msg.text ? "text" : "media", archived && inlineMedia && config.botUsername && !hasCustomEmoji ? 1 : 0, created.id, tid);
+      const inlineOptions = { link_preview_options: msg.link_preview_options, reply_markup: msg.reply_markup, has_media_spoiler: msg.has_media_spoiler };
+      const created = db.transaction(() => {
+        const row = createCampaign(db, tid, { name: message.slice(0, 50), message, senderAccountId: flow.accountId!, intervalSeconds: 300 }) as { id: number };
+        db.prepare("UPDATE campaigns SET messageEntities = ?, sourceChatId = ?, sourceMessageId = ?, richMessage = ?, richContent = ?, inlineOptions = ?, contentKind=?, inlineMode = ? WHERE id = ? AND tenantId = ?")
+          .run(JSON.stringify(entities), archived ? config.archiveChat : null, archived?.message_id ?? null, inlineMedia ? JSON.stringify(inlineMedia) : null, richContent ? JSON.stringify(richContent) : null, JSON.stringify(inlineOptions), richContent ? "rich" : msg.text ? "text" : "media", inlineSupported ? 1 : 0, row.id, tid);
+        return row;
+      })();
+      savedCampaignId = created.id;
       flows.delete(ctx.from.id);
-      await showCampaignAccounts(ctx, created.id);
+      await showCampaignAccounts(ctx, created.id, 0, flow);
     } catch (error) {
-      await replyRich(ctx, `Could not save this campaign: ${escapeHtml(String(error instanceof Error ? error.message : error))}`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign:back", "Back to campaigns")]]) });
+      await flowRich(ctx, flow, `${savedCampaignId ? "Campaign saved, but the account screen could not open" : "Could not save this campaign"}: ${escapeHtml(String(error instanceof Error ? error.message : error))}`, { parse_mode: "HTML", reply_markup: menu([[back(savedCampaignId ? `campaign:${savedCampaignId}` : "newcampaign:back", savedCampaignId ? "Open campaign" : "Back to campaigns")]]) });
     }
   });
   bot.catch((error) => console.error(`ads bot update failed: ${String(error)}`));

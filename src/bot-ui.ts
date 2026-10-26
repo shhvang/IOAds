@@ -60,6 +60,7 @@ export async function editRich(ctx: Context, content: string, options: Options =
   try {
     return await editRichAt(ctx, messageId, content, options);
   } catch (error) {
+    if (/message is not modified/i.test(String(error))) return true;
     // A callback on an older photo dashboard cannot be turned into a rich text message.
     if (/there is no text|message is not a text message|message can't be edited/i.test(String(error)))
       return replyRich(ctx, content, options);

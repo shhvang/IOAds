@@ -282,10 +282,11 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
     },
     async sendInline(target, query) {
       const current = await ready();
-      const bot = await current.invoke({ _: "searchPublicChat", username: config.botUsername });
+      const bot = await current.invoke({ _: "searchPublicChat", username: config.botUsername.replace(/^@/, "") });
       const results = await current.invoke({ _: "getInlineQueryResults", bot_user_id: bot.id, chat_id: chatId(target), query, offset: "" });
       const result = results.results[0];
-      if (!result) throw new Error("inline campaign result unavailable");
+      const expectedId = /^campaign:(\d+)$/.exec(query)?.[1];
+      if (!expectedId || results.results.length !== 1 || !result || result.id !== expectedId) throw new Error("inline campaign result unavailable");
       const sent = await current.invoke({ _: "sendInlineQueryResultMessage", chat_id: chatId(target), query_id: results.inline_query_id, result_id: result.id, hide_via_bot: false });
       await confirmed(sent);
     },
