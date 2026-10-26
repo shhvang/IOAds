@@ -24,11 +24,11 @@ async function handle(request: Request): Promise<void> {
     const invoke = () => (current.adapter[request.method] as (...args: unknown[]) => Promise<unknown>)(...request.args);
     const isSend = request.method === "sendMessage" || request.method === "copyMessage" || request.method === "sendInline";
     const value = isSend ? await (current.sendTail = current.sendTail.then(invoke, invoke)) : await invoke();
-    if (request.method === "logout" || request.method === "close") entries.delete(request.accountId);
     process.send?.({ id: request.id, ok: true, value });
   } catch (error) {
     process.send?.({ id: request.id, ok: false, error: String(error) });
   } finally {
+    if (request.method === "logout" || request.method === "close") entries.delete(request.accountId);
     if (entry) { entry.active -= 1; entry.lastUsed = Date.now(); }
   }
 }

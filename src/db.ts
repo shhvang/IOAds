@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS localUsers (telegramId INTEGER PRIMARY KEY, tenantId 
 CREATE TABLE IF NOT EXISTS botFlows (telegramId INTEGER PRIMARY KEY, data TEXT NOT NULL, updatedAt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS planPayments (id INTEGER PRIMARY KEY, telegramId INTEGER NOT NULL, tierCode TEXT NOT NULL, network TEXT NOT NULL, amount REAL NOT NULL, reference TEXT NOT NULL UNIQUE, externalId TEXT UNIQUE, createdAt TEXT NOT NULL, expiresAt TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS accounts (
-  accountId TEXT PRIMARY KEY, tenantId TEXT NOT NULL, ownerId INTEGER NOT NULL, phone TEXT, telegramUserId INTEGER,
+  accountId TEXT PRIMARY KEY, tenantId TEXT NOT NULL, ownerId INTEGER NOT NULL, phone TEXT, displayName TEXT, telegramUserId INTEGER,
   session TEXT, sessionType TEXT NOT NULL DEFAULT 'tdlib', status TEXT NOT NULL DEFAULT 'logged_out', loginPhone TEXT,
   phoneCodeHash TEXT, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL,
   UNIQUE (tenantId, accountId),
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
 CREATE INDEX IF NOT EXISTS campaigns_due ON campaigns(status, nextRunAt);
 CREATE TABLE IF NOT EXISTS campaignTargets (
   campaignId INTEGER NOT NULL, tenantId TEXT NOT NULL, accountId TEXT NOT NULL, chatId TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
-  createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, PRIMARY KEY (campaignId, chatId),
+  createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, PRIMARY KEY (campaignId, accountId, chatId),
   FOREIGN KEY (campaignId) REFERENCES campaigns(id) ON DELETE CASCADE,
   FOREIGN KEY (tenantId, accountId, chatId) REFERENCES groups(tenantId, accountId, chatId) ON DELETE CASCADE
 );
@@ -78,6 +78,8 @@ export function openDb(path: string): Database.Database {
   db.pragma("busy_timeout = 5000");
   migrateLegacyAccounts(db);
   db.exec(DDL);
+  migrateCampaignTargetKeys(db);
+  db.exec("CREATE INDEX IF NOT EXISTS campaign_targets_account ON campaignTargets(tenantId, campaignId, accountId, enabled)");
   const columns = db.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === "occurrenceKey")) db.exec("ALTER TABLE deliveries ADD COLUMN occurrenceKey TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS deliveries_occurrence ON deliveries(occurrenceKey) WHERE occurrenceKey IS NOT NULL");
@@ -90,6 +92,7 @@ export function openDb(path: string): Database.Database {
   if (!tenantColumns.some((column) => column.name === "controlBotToken")) db.exec("ALTER TABLE tenants ADD COLUMN controlBotToken TEXT");
   const accountColumns = db.prepare("PRAGMA table_info(accounts)").all() as Array<{ name: string }>;
   if (!accountColumns.some((column) => column.name === "sendAfter")) db.exec("ALTER TABLE accounts ADD COLUMN sendAfter TEXT");
+  if (!accountColumns.some((column) => column.name === "displayName")) db.exec("ALTER TABLE accounts ADD COLUMN displayName TEXT");
   const groupColumns = db.prepare("PRAGMA table_info(groups)").all() as Array<{ name: string }>;
   if (!groupColumns.some((column) => column.name === "lastSeenSync")) db.exec("ALTER TABLE groups ADD COLUMN lastSeenSync TEXT");
   if (!groupColumns.some((column) => column.name === "chatKind")) db.exec("ALTER TABLE groups ADD COLUMN chatKind TEXT NOT NULL DEFAULT 'unknown'");
@@ -124,6 +127,22 @@ export function openDb(path: string): Database.Database {
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS planPayments_externalId ON planPayments(externalId) WHERE externalId IS NOT NULL");
   db.exec("UPDATE tenants SET productId = 'ads-standalone' WHERE productId = 'ads' AND tenantId IN (SELECT tenantId FROM localUsers)");
   return db;
+}
+
+function migrateCampaignTargetKeys(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(campaignTargets)").all() as Array<{ name: string; pk: number }>;
+  if (columns.find((column) => column.name === "accountId")?.pk === 2) return;
+  db.transaction(() => {
+    db.exec(`CREATE TABLE campaignTargets_v2 (
+      campaignId INTEGER NOT NULL, tenantId TEXT NOT NULL, accountId TEXT NOT NULL, chatId TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+      createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, PRIMARY KEY (campaignId, accountId, chatId),
+      FOREIGN KEY (campaignId) REFERENCES campaigns(id) ON DELETE CASCADE,
+      FOREIGN KEY (tenantId, accountId, chatId) REFERENCES groups(tenantId, accountId, chatId) ON DELETE CASCADE
+    )`);
+    db.exec(`INSERT INTO campaignTargets_v2 (campaignId,tenantId,accountId,chatId,enabled,createdAt,updatedAt)
+      SELECT campaignId,tenantId,accountId,chatId,enabled,createdAt,updatedAt FROM campaignTargets`);
+    db.exec("DROP TABLE campaignTargets; ALTER TABLE campaignTargets_v2 RENAME TO campaignTargets");
+  })();
 }
 
 function migrateLegacyAccounts(db: Database.Database): void {

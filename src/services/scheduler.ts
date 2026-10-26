@@ -18,19 +18,22 @@ const nextDay = (): string => {
 };
 
 function planDeliveries(db: Database.Database): void {
-  db.prepare("UPDATE deliveries SET status='skipped',error='target disabled' WHERE status IN ('pending','retry') AND (NOT EXISTS (SELECT 1 FROM groups g WHERE g.tenantId=deliveries.tenantId AND g.accountId=deliveries.accountId AND g.chatId=deliveries.chatId AND g.enabled=1 AND g.chatKind='group') OR NOT EXISTS (SELECT 1 FROM campaignTargets ct WHERE ct.campaignId=deliveries.campaignId AND ct.chatId=deliveries.chatId AND ct.enabled=1))").run();
+  db.prepare("UPDATE deliveries SET status='skipped',error='account or target unavailable' WHERE status IN ('pending','retry') AND (NOT EXISTS (SELECT 1 FROM accounts a WHERE a.tenantId=deliveries.tenantId AND a.accountId=deliveries.accountId AND a.status='active' AND a.session IS NOT NULL) OR NOT EXISTS (SELECT 1 FROM groups g WHERE g.tenantId=deliveries.tenantId AND g.accountId=deliveries.accountId AND g.chatId=deliveries.chatId AND g.enabled=1 AND g.chatKind='group') OR NOT EXISTS (SELECT 1 FROM campaignTargets ct WHERE ct.campaignId=deliveries.campaignId AND ct.accountId=deliveries.accountId AND ct.chatId=deliveries.chatId AND ct.enabled=1))").run();
   const due = db.prepare("SELECT c.id FROM campaigns c JOIN tenants t ON t.tenantId=c.tenantId LEFT JOIN localUsers u ON u.tenantId=c.tenantId WHERE c.status='scheduled' AND (c.nextRunAt IS NULL OR c.nextRunAt<=?) AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) ORDER BY c.nextRunAt,c.id LIMIT 1000").all(now()) as Array<{ id: number }>;
   const plan = db.transaction((id: number) => {
     const c = db.prepare("SELECT c.*,t.state,t.runtime,t.suspendReason,u.forceJoined FROM campaigns c JOIN tenants t ON t.tenantId=c.tenantId LEFT JOIN localUsers u ON u.tenantId=c.tenantId WHERE c.id=?").get(id) as Record<string, unknown> | undefined;
     if (!c || c.status !== "scheduled" || c.state !== "active" || c.runtime !== "service" || c.suspendReason === "blocked" || c.forceJoined === 0) return;
     const time = now();
     if (c.nextRunAt && String(c.nextRunAt) > time) return;
-    const busy = db.prepare("SELECT 1 FROM deliveries WHERE campaignId=? AND status IN ('pending','retry','claimed') LIMIT 1").get(id);
     db.prepare("UPDATE campaigns SET nextRunAt=?,updatedAt=? WHERE id=?").run(new Date(Date.now() + Number(c.intervalSeconds) * 1000).toISOString(), time, id);
-    if (busy) return; // Keep one occurrence outstanding instead of accumulating an unbounded backlog.
     const occurrence = `${id}:${c.nextRunAt ?? time}`;
-    db.prepare("INSERT OR IGNORE INTO deliveries (tenantId,campaignId,chatId,accountId,occurrenceKey,status,attempts,nextAttemptAt,createdAt) SELECT ct.tenantId,ct.campaignId,ct.chatId,ct.accountId,? || ':' || ct.accountId || ':' || ct.chatId,'pending',0,?,? FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId WHERE ct.campaignId=? AND ct.tenantId=? AND ct.accountId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group'")
-      .run(occurrence, time, time, id, c.tenantId, c.senderAccountId);
+    db.prepare(`INSERT OR IGNORE INTO deliveries (tenantId,campaignId,chatId,accountId,occurrenceKey,status,attempts,nextAttemptAt,createdAt)
+      SELECT ct.tenantId,ct.campaignId,ct.chatId,ct.accountId,? || ':' || ct.accountId || ':' || ct.chatId,'pending',0,?,?
+      FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId
+      JOIN accounts a ON a.tenantId=ct.tenantId AND a.accountId=ct.accountId
+      WHERE ct.campaignId=? AND ct.tenantId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' AND a.status='active' AND a.session IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.campaignId=ct.campaignId AND d.accountId=ct.accountId AND d.status IN ('pending','retry','claimed') AND d.occurrenceKey NOT LIKE ? || ':%')`)
+      .run(occurrence, time, time, id, c.tenantId, occurrence);
   });
   for (const row of due) plan(row.id);
 }
@@ -38,7 +41,7 @@ function planDeliveries(db: Database.Database): void {
 function claimDelivery(db: Database.Database): Delivery | "deferred" | null {
   return db.transaction(() => {
     const time = now();
-    const candidate = db.prepare("SELECT d.id,d.tenantId,d.campaignId,c.dailyLimit FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN tenants t ON t.tenantId=d.tenantId JOIN accounts a ON a.accountId=d.accountId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN campaignTargets ct ON ct.campaignId=d.campaignId AND ct.chatId=d.chatId LEFT JOIN localUsers u ON u.tenantId=d.tenantId WHERE d.status IN ('pending','retry') AND (d.nextAttemptAt IS NULL OR d.nextAttemptAt<=?) AND c.status='scheduled' AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) AND a.status='active' AND a.session IS NOT NULL AND (a.sendAfter IS NULL OR a.sendAfter<=?) AND g.enabled=1 AND g.chatKind='group' AND ct.enabled=1 AND NOT EXISTS (SELECT 1 FROM deliveries active WHERE active.accountId=d.accountId AND active.status='claimed') ORDER BY d.nextAttemptAt,d.id LIMIT 1")
+    const candidate = db.prepare("SELECT d.id,d.tenantId,d.campaignId,c.dailyLimit FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN tenants t ON t.tenantId=d.tenantId JOIN accounts a ON a.tenantId=d.tenantId AND a.accountId=d.accountId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN campaignTargets ct ON ct.campaignId=d.campaignId AND ct.accountId=d.accountId AND ct.chatId=d.chatId LEFT JOIN localUsers u ON u.tenantId=d.tenantId WHERE d.status IN ('pending','retry') AND (d.nextAttemptAt IS NULL OR d.nextAttemptAt<=?) AND c.status='scheduled' AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) AND a.status='active' AND a.session IS NOT NULL AND (a.sendAfter IS NULL OR a.sendAfter<=?) AND g.enabled=1 AND g.chatKind='group' AND ct.enabled=1 AND NOT EXISTS (SELECT 1 FROM deliveries active WHERE active.accountId=d.accountId AND active.status='claimed') ORDER BY d.nextAttemptAt,d.id LIMIT 1")
       .get(time, time) as { id: number; tenantId: string; campaignId: number; dailyLimit: number } | undefined;
     if (!candidate) return null;
     const limits = tenantLimits(db, candidate.tenantId);
@@ -94,7 +97,7 @@ async function deliver(db: Database.Database, d: Delivery, getAdapter: (tenantId
       db.prepare("UPDATE deliveries SET status=?,nextAttemptAt=?,claimedAt=NULL,error=? WHERE id=? AND status='claimed'")
         .run(delay === null ? "failed" : "retry", delay === null ? null : new Date(Date.now() + delay * 1000).toISOString(), String(error).slice(0, 500), d.id);
       if (String(error).includes("needs Premium to send custom emoji"))
-        db.prepare("UPDATE campaigns SET status='paused',updatedAt=? WHERE id=? AND status='scheduled'").run(now(), d.campaignId);
+        db.prepare("UPDATE campaignTargets SET enabled=0,updatedAt=? WHERE campaignId=? AND accountId=?").run(now(), d.campaignId, d.accountId);
       if (delay !== null && /FLOOD|retry.after|wait(?: of)?\s+\d+/i.test(String(error)))
         db.prepare("UPDATE accounts SET sendAfter=? WHERE tenantId=? AND accountId=?")
           .run(new Date(Date.now() + delay * 1000).toISOString(), d.tenantId, d.accountId);

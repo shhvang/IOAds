@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { openDb, now } from "./db.js";
 import { config } from "./config.js";
 import { FakeTelegramAdapter } from "./telegram.js";
-import { createCampaign, setCampaignStatus } from "./services/campaigns.js";
+import { addTarget as addCampaignTarget, createCampaign, setCampaignStatus } from "./services/campaigns.js";
 import { runSchedulerOnce } from "./services/scheduler.js";
 
 config.deliveryConcurrency = 16;
@@ -50,5 +50,20 @@ db.prepare("UPDATE deliveries SET nextAttemptAt='2000-01-01T00:00:00.000Z' WHERE
 await runSchedulerOnce(db, (_tenant, accountId) => accountId === "flaky" ? flaky : adapter);
 assert.equal((db.prepare("SELECT status FROM deliveries WHERE campaignId=?").get(retryCampaign.id) as { status: string }).status, "sent");
 
+// One campaign can deliver the same group through two accounts, while each account keeps its own selection.
+db.prepare("UPDATE campaigns SET status='paused' WHERE id=?").run(created.id);
+db.prepare("INSERT INTO groups (tenantId,accountId,chatId,title,enabled,chatKind,createdAt,updatedAt) VALUES ('large','sender','-999','Shared',1,'group',?,?)").run(time, time);
+const shared = createCampaign(db, "large", { name: "per account", message: "same campaign", senderAccountId: "sender", intervalSeconds: 300 }) as { id: number };
+db.prepare("UPDATE accounts SET sendAfter=NULL WHERE tenantId='large' AND accountId='sender'").run();
+await addCampaignTarget(db, "large", shared.id, "-999", "sender");
+await addCampaignTarget(db, "large", shared.id, "-999", "flaky");
+await addCampaignTarget(db, "large", shared.id, "-1000", "sender");
+setCampaignStatus(db, "large", shared.id, "scheduled");
+const primaryAdapter = new FakeTelegramAdapter();
+const secondaryAdapter = new FakeTelegramAdapter();
+for (let i = 0; i < 3; i += 1) await runSchedulerOnce(db, (_tenant, accountId) => accountId === "sender" ? primaryAdapter : secondaryAdapter);
+assert.deepEqual(primaryAdapter.sent.map((item) => item.chatId).sort(), ["-1000", "-999"]);
+assert.deepEqual(secondaryAdapter.sent.map((item) => item.chatId), ["-999"]);
+assert.equal((db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE campaignId=? AND status='sent'").get(shared.id) as { n: number }).n, 3);
 db.close();
 console.log("scheduler: complete fanout, cooldown, and retry pass");

@@ -17,8 +17,9 @@ export interface TelegramDialog {
 
 export interface TelegramAdapter {
   sendCode(phone: string): Promise<{ phoneCodeHash: string }>;
-  signIn(phone: string, phoneCodeHash: string, code: string, password?: string): Promise<{ session: string; userId: number }>;
-  resumeSession(): Promise<{ userId: number } | null>;
+  signIn(phone: string, phoneCodeHash: string, code: string, password?: string): Promise<{ session: string; userId: number; displayName: string }>;
+  resumeSession(): Promise<{ userId: number; displayName: string } | null>;
+  profile(): Promise<{ userId: number; displayName: string }>;
   dialogs(): Promise<TelegramDialog[]>;
   canPost(chatId: string): Promise<boolean>;
   sendMessage(chatId: string, message: string, entities?: Array<Record<string, unknown>>): Promise<void>;
@@ -71,6 +72,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
   mkdirSync(directory, { recursive: true });
   let client: Client | null = null;
   let userId = 0;
+  let displayName = "";
   let userPremium = false;
   let authReadyDone = false;
   let previouslyAuthorized = false;
@@ -159,7 +161,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       if (state._ === "authorizationStateReady") {
         setPhase("ready");
         previouslyAuthorized = true;
-        void td.invoke({ _: "getMe" }).then((me) => { userId = me.id; userPremium = me.is_premium; authReadyDone = true; authReadyResolve(); }).catch(authReadyReject);
+        void td.invoke({ _: "getMe" }).then((me) => { userId = me.id; displayName = [me.first_name, me.last_name].filter(Boolean).join(" ").trim(); userPremium = me.is_premium; authReadyDone = true; authReadyResolve(); }).catch(authReadyReject);
       }
     }
   });
@@ -177,7 +179,15 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       await Promise.race([firstAuth, new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error("Telegram session check timed out")), 15_000))]);
       if (authPhase !== "ready") return null;
       await Promise.race([ready(), new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error("Telegram session check timed out")), 15_000))]);
-      return { userId };
+      return { userId, displayName };
+    },
+    async profile() {
+      const current = await ready();
+      const me = await current.invoke({ _: "getMe" });
+      userId = me.id;
+      displayName = [me.first_name, me.last_name].filter(Boolean).join(" ").trim();
+      userPremium = me.is_premium;
+      return { userId, displayName };
     },
     async sendCode(phone) {
       await waitForPhase("phone", "closed");
@@ -208,7 +218,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       } else throw new Error("Telegram is not waiting for a login code");
       if (currentPhase() === "closed") throw new Error("Telegram closed the login session");
       await ready();
-      return { session: `tdlib:${accountId}`, userId };
+      return { session: `tdlib:${accountId}`, userId, displayName };
     },
     async dialogs() {
       const current = await ready();
@@ -289,10 +299,17 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       sendWaiters.clear();
       sendResults.clear();
       setPhase("closed");
-      if (!current || current.isClosed()) { client = null; return; }
+      if (!current || current.isClosed()) { client = null; rmSync(directory, { recursive: true, force: true }); return; }
+      let loggedOut = !authReadyDone;
       try {
-        if (authReadyDone) await current.invoke({ _: "logOut" });
-      } finally { await current.close(); client = null; rmSync(directory, { recursive: true, force: true }); }
+        if (authReadyDone) { await current.invoke({ _: "logOut" }); loggedOut = true; }
+      } finally {
+        try { await current.close(); }
+        finally {
+          client = null;
+          if (loggedOut) rmSync(directory, { recursive: true, force: true });
+        }
+      }
     },
     async close() {
       const current = client;
@@ -315,8 +332,9 @@ export class FakeTelegramAdapter implements TelegramAdapter {
   readonly inlineSent: Array<{ chatId: string; query: string }> = [];
   readonly groups: TelegramDialog[] = [];
   async sendCode(_phone: string): Promise<{ phoneCodeHash: string }> { return { phoneCodeHash: "fake-hash" }; }
-  async signIn(_phone: string, _phoneCodeHash: string, _code: string, _password?: string): Promise<{ session: string; userId: number }> { return { session: "fake-session", userId: 1 }; }
-  async resumeSession(): Promise<{ userId: number } | null> { return { userId: 1 }; }
+  async signIn(_phone: string, _phoneCodeHash: string, _code: string, _password?: string): Promise<{ session: string; userId: number; displayName: string }> { return { session: "fake-session", userId: 1, displayName: "Test Account" }; }
+  async resumeSession(): Promise<{ userId: number; displayName: string } | null> { return { userId: 1, displayName: "Test Account" }; }
+  async profile(): Promise<{ userId: number; displayName: string }> { return { userId: 1, displayName: "Test Account" }; }
   async dialogs(): Promise<TelegramDialog[]> { return this.groups; }
   async canPost(_chatId: string): Promise<boolean> { return true; }
   async sendMessage(chatId: string, message: string, _entities?: Array<Record<string, unknown>>): Promise<void> { this.sent.push({ chatId, message }); }

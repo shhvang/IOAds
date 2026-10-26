@@ -1,12 +1,13 @@
 import type Database from "better-sqlite3";
 import { now } from "../db.js";
-import { adapterFor, requireAccount } from "./account.js";
+import { adapterFor, refreshAccountProfile, requireAccount } from "./account.js";
 import { writeAudit } from "./audit.js";
 import { limitFor } from "./limits.js";
 import { randomUUID } from "node:crypto";
 
 export async function syncGroups(db: Database.Database, tenantId: string, accountId: string): Promise<unknown[]> {
   requireAccount(db, tenantId, accountId, true);
+  await refreshAccountProfile(db, tenantId, accountId);
   const groups = await adapterFor(db, tenantId, accountId).dialogs();
   const marker = randomUUID();
   const insert = db.prepare(`INSERT INTO groups (tenantId, accountId, chatId, title, username, chatKind, lastSeenSync, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

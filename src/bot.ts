@@ -5,8 +5,8 @@ import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { now } from "./db.js";
-import { accounts, canRestoreAccount, cancelLogin, deleteAccount, loginComplete, loginStart, logout, restoreAccount } from "./services/account.js";
-import { addTarget, clearTargets, createCampaign, listCampaigns, selectAllTargets, setCampaignStatus, updateTarget } from "./services/campaigns.js";
+import { accounts, canRestoreAccount, cancelLogin, deleteAccount, loginComplete, loginStart, logout, refreshAccountProfile, restoreAccount } from "./services/account.js";
+import { addTarget, clearTargets, createCampaign, deleteCampaign, listCampaigns, selectAllTargets, setCampaignStatus, updateTarget } from "./services/campaigns.js";
 import { syncGroups, setGroup } from "./services/groups.js";
 import { tierLimits } from "./services/plans.js";
 import { enforceTenantLimits } from "./services/limits.js";
@@ -70,6 +70,7 @@ function loginError(error: unknown): string {
   if (text.includes("PASSWORD_HASH_INVALID")) return "The 2FA password is incorrect.";
   if (text.includes("LOGIN CODE WAS NOT REQUESTED")) return "This login session expired. Cancel and request a new code.";
   if (text.includes("FLOOD_WAIT")) return "Telegram is rate limiting login attempts. Wait before trying again.";
+  if (text.includes("ALREADY CONNECTED")) return "This Telegram account is already in your account list. Open that entry instead.";
   if (/TIMEOUT|NETWORK|CONNECTION/.test(text)) return "Telegram is taking too long to respond. Try again shortly.";
   return "Telegram could not complete this step. Try again or cancel the login.";
 }
@@ -93,8 +94,8 @@ export function startAdsBot(db: Database.Database): void {
     if (!row) throw new Error("Send /start to set up your ads account.");
     return row.tenantId;
   };
-  const home = (connected = true) => menu([
-    [button(connected ? "Create campaign" : "Connect account", connected ? "newcampaign" : "connect", "primary", "plus")],
+  const home = (primary: "campaign" | "accounts" | "connect" = "campaign") => menu([
+    [button(primary === "campaign" ? "Create campaign" : primary === "accounts" ? "Restore an account" : "Connect account", primary === "campaign" ? "newcampaign" : primary === "accounts" ? "accounts" : "connect", "primary", primary === "accounts" ? "refresh" : "plus")],
     [button("Campaigns", "campaigns", undefined, "megaphone"), button("Accounts", "accounts", undefined, "people")],
     [button("Groups", "groups", undefined, "people"), button("Activity", "activity", undefined, "chart")],
     [button("Plan", "plan", undefined, "card"), button("Help", "help", "link", "support")],
@@ -106,11 +107,13 @@ export function startAdsBot(db: Database.Database): void {
     const user = db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(userId) as { tierCode: string };
     const sentToday = (db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE tenantId = ? AND status='sent' AND sentAt >= date('now')").get(tid) as { n: number }).n;
     const limits = tierLimits(user.tierCode);
-    const connected = accounts(db, tid).filter((a) => a.status === "active").length;
+    const accountList = accounts(db, tid);
+    const connected = accountList.filter((a) => a.status === "active").length;
+    const primary = connected ? "campaign" : accountList.some((account) => account.phone) ? "accounts" : "connect";
     const running = Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId = ? AND status = 'scheduled'").get(tid) as { n: number }).n);
-    const caption = `<h2>IOAds</h2><p>Schedule posts to groups your connected account already belongs to.</p><hr/><table compact><tr><td>Accounts</td><td>${connected} / ${limits.accounts}</td></tr><tr><td>Scheduled</td><td>${running}</td></tr><tr><td>Sent today</td><td>${sentToday.toLocaleString()} / ${limits.dailyMessages.toLocaleString()}</td></tr></table><p>${connected ? "Ready to create a campaign. Forward the post you want to send." : "First, connect an account. Then choose its groups and forward a post."}</p>`;
-    if (ctx.callbackQuery) await editRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(connected > 0) });
-    else await replyRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(connected > 0) });
+    const caption = `<h2>IOAds</h2><p>Schedule posts to groups your connected accounts already belong to.</p><hr/><table compact><tr><td>Accounts</td><td>${connected} / ${limits.accounts}</td></tr><tr><td>Scheduled</td><td>${running}</td></tr><tr><td>Sent today</td><td>${sentToday.toLocaleString()} / ${limits.dailyMessages.toLocaleString()}</td></tr></table><p>${primary === "campaign" ? "Ready to create a campaign. Forward the post you want to send." : primary === "accounts" ? "Your saved account needs attention. Open Accounts to restore or reconnect it." : "First, connect an account. Then choose its groups and forward a post."}</p>`;
+    if (ctx.callbackQuery) await editRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(primary) });
+    else await replyRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(primary) });
   };
   bot.use(async (ctx, next) => {
     if (ctx.chatMember) { await next(); return; }
@@ -170,7 +173,7 @@ export function startAdsBot(db: Database.Database): void {
     await showHome(ctx);
   });
   bot.command("menu", showHome);
-  const helpContent = `<h2>How IOAds works</h2><ol><li>Connect the Telegram account that will post.</li><li>Sync groups that account already belongs to.</li><li>Forward a post, choose groups, and review its frequency.</li><li>Start the campaign and follow deliveries in Activity.</li></ol><details><summary>What the bot can access</summary><p>IOAds sends only to groups visible to your connected account. It does not join groups, discover members, or send direct messages.</p></details>`;
+  const helpContent = `<h2>How IOAds works</h2><ol><li>Connect the Telegram accounts that will post.</li><li>Sync groups each account already belongs to.</li><li>Forward a post, then choose groups separately for each account.</li><li>Review the frequency, start the campaign, and follow deliveries in Activity.</li></ol><details><summary>What the bot can access</summary><p>IOAds sends only to groups visible to a connected account. It does not join groups, discover members, or send direct messages.</p></details>`;
   bot.command("help", (ctx) => replyRich(ctx, helpContent, { parse_mode: "HTML", reply_markup: menu([[button("Create campaign", "newcampaign", "primary", "plus")], [button("Accounts", "accounts", undefined, "people"), button("Groups", "groups", undefined, "people")], [back("home", "Back to home")]]) }));
   bot.callbackQuery("help", async (ctx) => { await ctx.answerCallbackQuery(); await editRich(ctx, helpContent, { parse_mode: "HTML", reply_markup: menu([[button("Create campaign", "newcampaign", "primary", "plus")], [button("Accounts", "accounts", undefined, "people"), button("Groups", "groups", undefined, "people")], [back("home", "Back to home")]]) }); });
   bot.callbackQuery("schedule", async (ctx) => { await ctx.answerCallbackQuery(); await editRich(ctx, "<b>Schedule</b>\nReview campaign status, delivery interval, target groups, and posting method. Open any campaign to pause it or change its timing.", { parse_mode: "HTML", reply_markup: menu([[button("Campaigns", "campaigns")], [button("New campaign", "newcampaign")], [back("home", "Back to home")]]) }); });
@@ -181,7 +184,8 @@ export function startAdsBot(db: Database.Database): void {
     await editRich(ctx, `🗃 <b>Activity</b>\nRecent campaign deliveries\n\n${body}`, { parse_mode: "HTML", reply_markup: menu([[button("Campaigns", "campaigns")], [back("home", "Back to home")]]) });
   });
   bot.callbackQuery("settings", async (ctx) => { await ctx.answerCallbackQuery(); await editRich(ctx, "<b>Settings</b>\nManage linked Telegram accounts, group access, plan limits, and campaign delivery preferences.", { parse_mode: "HTML", reply_markup: menu([[button("Accounts", "accounts"), button("Groups", "groups")], [button("Plan", "plan")], [back("home", "Back to home")]]) }); });
-  const accountLabel = (account: ReturnType<typeof accounts>[number]): string => account.phone ?? `Login attempt ${new Date(account.createdAt).toLocaleDateString("en-GB", { day: "2-digit", month: "short", timeZone: "UTC" })} · ${account.accountId.slice(0, 6)}`;
+  const accountLabel = (account: ReturnType<typeof accounts>[number]): string => account.phone ? `${account.displayName ? `${account.displayName} · ` : ""}${account.phone}` : `Login attempt ${new Date(account.createdAt).toLocaleDateString("en-GB", { day: "2-digit", month: "short", timeZone: "UTC" })} · ${account.accountId.slice(0, 6)}`;
+  const accountButtonLabel = (account: ReturnType<typeof accounts>[number]): string => account.phone && account.displayName ? `${account.displayName.slice(0, 18)} · ${account.phone}` : accountLabel(account).slice(0, 36);
   const accountState = (status: string): string => status === "active" ? "Connected" : status === "limit_paused" ? "Paused by plan limit" : status === "connecting" ? "Login in progress" : "Disconnected";
   const loginBack = (userId: number): Button => {
     const accountId = flows.get(userId)?.accountId;
@@ -189,10 +193,16 @@ export function startAdsBot(db: Database.Database): void {
     return back("login:cancel", known ? "Back to account" : "Back to accounts");
   };
   const showAccounts = async (ctx: Context, requestedPage = 0) => {
-    const list = accounts(db, tenantId(ctx.from!.id));
+    const tid = tenantId(ctx.from!.id);
+    const missing = accounts(db, tid).filter((account) => account.status === "active" && !account.displayName);
+    if (missing.length) await Promise.race([
+      Promise.allSettled(missing.map((account) => refreshAccountProfile(db, tid, account.accountId))),
+      new Promise<void>((resolve) => setTimeout(resolve, 8_000)),
+    ]);
+    const list = accounts(db, tid);
     const pageSize = 6, page = Math.min(Math.max(0, requestedPage), Math.max(0, Math.ceil(list.length / pageSize) - 1));
     const visible = list.slice(page * pageSize, (page + 1) * pageSize);
-    const rows: Button[][] = [[button("Connect account", "connect", "primary", "plus")], ...visible.map((account) => [button(`${account.status === "active" ? "" : account.status === "limit_paused" ? "⏸ " : "○ "}${accountLabel(account).slice(0, 36)}`, `account:${account.accountId}`, undefined, account.status === "active" ? "check" : undefined)])];
+    const rows: Button[][] = [[button("Connect account", "connect", "primary", "plus")], ...visible.map((account) => [button(`${account.status === "active" ? "" : account.status === "limit_paused" ? "⏸ " : "○ "}${accountButtonLabel(account)}`, `account:${account.accountId}`, undefined, account.status === "active" ? "check" : undefined)])];
     if (list.length > pageSize) rows.push([...(page ? [button("Previous", `accounts:${page - 1}`, undefined, "prev")] : []), ...(page < Math.ceil(list.length / pageSize) - 1 ? [button("Next", `accounts:${page + 1}`, undefined, "next")] : [])]);
     rows.push([back("home", "Back to home")]);
     const connected = list.filter((account) => account.status === "active").length;
@@ -205,7 +215,7 @@ export function startAdsBot(db: Database.Database): void {
   const showAccount = async (ctx: Context, accountId: string) => {
     const account = accounts(db, tenantId(ctx.from!.id)).find((item) => item.accountId === accountId);
     if (!account) return editRich(ctx, "Account not found.", { reply_markup: menu([[back("accounts", "Back to accounts")]]) });
-    const linkedCampaigns = (db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId=? AND senderAccountId=?").get(tenantId(ctx.from!.id), accountId) as { n: number }).n;
+    const linkedCampaigns = (db.prepare("SELECT COUNT(*) AS n FROM campaigns c WHERE c.tenantId=? AND (c.senderAccountId=? OR EXISTS (SELECT 1 FROM campaignTargets ct WHERE ct.campaignId=c.id AND ct.tenantId=c.tenantId AND ct.accountId=?))").get(tenantId(ctx.from!.id), accountId, accountId) as { n: number }).n;
     const rows: Button[][] = [];
     if (account.status === "active") rows.push([button("Manage groups", `groupsof:${accountId}:0`, "primary", "people")]);
     if (canRestoreAccount(db, tenantId(ctx.from!.id), accountId)) rows.push([button("Restore saved session", `restore:${accountId}`, "primary", "refresh")]);
@@ -241,7 +251,8 @@ export function startAdsBot(db: Database.Database): void {
     await ctx.answerCallbackQuery();
     if (!account) return editRich(ctx, "Account not found.", { reply_markup: menu([[back("accounts", "Back to accounts")]]) });
     const count = (db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId=? AND senderAccountId=?").get(tenantId(ctx.from.id), accountId) as { n: number }).n;
-    await editRich(ctx, `<h2>Remove account entry?</h2><p>${escapeHtml(accountLabel(account))}${count ? ` is used by ${count} campaign${count === 1 ? "" : "s"}. Remove those campaigns first.` : " and its saved session will be deleted."}</p>`, { parse_mode: "HTML", reply_markup: menu([...(count ? [] : [[button("Remove entry", `delete:${accountId}`, "danger", "trash")]]), [back(`account:${accountId}`, "Back to account")]]) });
+    const secondary = (db.prepare("SELECT COUNT(DISTINCT campaignId) AS n FROM campaignTargets WHERE tenantId=? AND accountId=?").get(tenantId(ctx.from.id), accountId) as { n: number }).n;
+    await editRich(ctx, `<h2>Remove account entry?</h2><p>${escapeHtml(accountLabel(account))}${count ? ` started ${count} campaign${count === 1 ? "" : "s"}. Delete or change those campaigns first.` : `. Its saved session${secondary ? `, selections in ${secondary} campaign${secondary === 1 ? "" : "s"}, and related delivery history` : ""} will be deleted.`}</p>`, { parse_mode: "HTML", reply_markup: menu([...(count ? [] : [[button("Remove entry", `delete:${accountId}`, "danger", "trash")]]), [back(`account:${accountId}`, "Back to account")]]) });
   });
   bot.callbackQuery(/^delete:(.+)$/, async (ctx) => {
     const accountId = ctx.match[1]!;
@@ -253,13 +264,13 @@ export function startAdsBot(db: Database.Database): void {
     const account = accounts(db, tenantId(ctx.from.id)).find((item) => item.accountId === accountId);
     await ctx.answerCallbackQuery();
     if (!account) return editRich(ctx, "Account not found.", { reply_markup: menu([[back("accounts", "Back to accounts")]]) });
-    await editRich(ctx, `<h2>Disconnect account?</h2><p>${escapeHtml(account.phone ?? "Telegram account")} will stop sending. Campaigns using it will pause until it reconnects.</p>`, { parse_mode: "HTML", reply_markup: menu([[button("Disconnect", `logout:${accountId}`, "danger", "cross")], [back(`account:${accountId}`, "Back to account")]]) });
+    await editRich(ctx, `<h2>Disconnect account?</h2><p>${escapeHtml(accountLabel(account))} will stop sending. Other connected accounts in the same campaigns can continue.</p>`, { parse_mode: "HTML", reply_markup: menu([[button("Disconnect", `logout:${accountId}`, "danger", "cross")], [back(`account:${accountId}`, "Back to account")]]) });
   });
   bot.callbackQuery(/^logout:(.+)$/, async (ctx) => {
     try {
       await logout(db, tenantId(ctx.from.id), ctx.match[1]!);
       await ctx.answerCallbackQuery("Userbot logged out");
-      await editRich(ctx, "Account disconnected. Campaigns using it will wait until the account reconnects.", { reply_markup: menu([[back("accounts", "Back to accounts")]]) });
+      await editRich(ctx, "Account disconnected. Its deliveries will wait until it reconnects; other connected accounts can continue.", { reply_markup: menu([[back("accounts", "Back to accounts")]]) });
     } catch (error) {
       await ctx.answerCallbackQuery({ text: String(error instanceof Error ? error.message : error), show_alert: true });
     }
@@ -303,8 +314,7 @@ export function startAdsBot(db: Database.Database): void {
     const campaignId = /^campaign:(\d+)$/.exec(ctx.inlineQuery.query)?.[1];
     const campaigns = (campaignId
       ? db.prepare(`SELECT c.id, c.name, c.message, c.messageEntities, c.richMessage FROM campaigns c
-          JOIN accounts a ON a.tenantId = c.tenantId AND a.accountId = c.senderAccountId
-          WHERE c.id = ? AND ((? IS NOT NULL AND c.tenantId = ? AND ? = 1) OR a.telegramUserId = ?)`)
+          WHERE c.id = ? AND ((? IS NOT NULL AND c.tenantId = ? AND ? = 1) OR EXISTS (SELECT 1 FROM campaignTargets ct JOIN accounts a ON a.tenantId=ct.tenantId AND a.accountId=ct.accountId WHERE ct.campaignId=c.id AND ct.tenantId=c.tenantId AND a.telegramUserId = ?))`)
         .all(Number(campaignId), user?.tenantId ?? null, user?.tenantId ?? null, user ? 1 : 0, ctx.from.id)
       : user
         ? db.prepare("SELECT id, name, message, messageEntities, richMessage FROM campaigns WHERE tenantId = ? AND status IN ('draft','scheduled','paused') ORDER BY id DESC LIMIT 20").all(user.tenantId)
@@ -328,7 +338,7 @@ export function startAdsBot(db: Database.Database): void {
       const draft = existing.find((item) => item.status === "draft");
       return editRich(ctx, draft ? "You already have a draft. Select its groups and schedule it here." : "Your plan’s campaign limit is full. Open a campaign to manage it.", { reply_markup: menu([[button(draft ? "Open draft" : "Campaigns", draft ? `campaign:${draft.id}` : "campaigns", "primary")], [back("campaigns", "Back to campaigns")]]) });
     }
-    if (list.length > 1) return editRich(ctx, `<h2>New campaign</h2><p>Which account should post it? You will choose groups from that account next.</p>`, { parse_mode: "HTML", reply_markup: menu([...list.map((account) => [button(account.phone ?? "Telegram account", `campaignfrom:${account.accountId}`)]), [back("newcampaign:back", "Back to campaigns")]]) });
+    if (list.length > 1) return editRich(ctx, `<h2>New campaign</h2><p>Choose an account to begin. After forwarding your post, you can add other accounts and choose different groups for each one.</p>`, { parse_mode: "HTML", reply_markup: menu([...list.map((account) => [button(accountButtonLabel(account), `campaignfrom:${account.accountId}`)]), [back("newcampaign:back", "Back to campaigns")]]) });
     flows.set(ctx.from.id, { action: "campaign", accountId: list[0]!.accountId });
     await editRich(ctx, `<h2>Send your post</h2><p>Forward the ad here. Text, formatting, and supported media will be kept.</p><p>Next you will choose groups and review the schedule before starting.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign:back", "Back to campaigns")]]) });
   });
@@ -337,7 +347,7 @@ export function startAdsBot(db: Database.Database): void {
     const account = accounts(db, tenantId(ctx.from.id)).find((item) => item.accountId === ctx.match[1] && item.status === "active");
     if (!account) return editRich(ctx, "That account is unavailable. Choose another account.", { reply_markup: menu([[back("newcampaign", "Back to account choice")]]) });
     flows.set(ctx.from.id, { action: "campaign", accountId: account.accountId });
-    await editRich(ctx, `<h2>Send your post</h2><p><b>Sending from:</b> ${escapeHtml(account.phone ?? "Telegram account")}</p><p>Forward the ad here. Then choose groups and review its schedule.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign", "Back to account choice")]]) });
+    await editRich(ctx, `<h2>Send your post</h2><p><b>Starting with:</b> ${escapeHtml(accountLabel(account))}</p><p>Forward the ad here. Then choose groups for this account, add any other accounts, and review the schedule.</p>`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign", "Back to account choice")]]) });
   });
   bot.callbackQuery("newcampaign:back", async (ctx) => { flows.delete(ctx.from.id); await ctx.answerCallbackQuery(); await showCampaigns(ctx); });
   const showCampaign = async (ctx: Context, id: number) => {
@@ -347,14 +357,15 @@ export function startAdsBot(db: Database.Database): void {
     const tid = tenantId(ctx.from!.id);
     const inline = db.prepare("SELECT inlineMode,contentKind,messageEntities FROM campaigns WHERE tenantId = ? AND id = ?").get(tid, id) as { inlineMode: number; contentKind: string; messageEntities: string };
     const hasCustomEmoji = (JSON.parse(inline.messageEntities || "[]") as Array<{ type: string }>).some((entity) => entity.type === "custom_emoji");
-    const targets = (db.prepare(`SELECT COUNT(*) AS count FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId WHERE ct.tenantId=? AND ct.campaignId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group'`).get(tid, id) as { count: number }).count;
+    const targets = (db.prepare(`SELECT COUNT(*) AS count FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId JOIN accounts a ON a.tenantId=ct.tenantId AND a.accountId=ct.accountId WHERE ct.tenantId=? AND ct.campaignId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' AND a.status='active' AND a.session IS NOT NULL`).get(tid, id) as { count: number }).count;
     const rows: Button[][] = [
-      [button(`Choose groups · ${targets} selected`, `campaigntargets:${id}`, "primary")],
+      [button(`Accounts & groups · ${targets} selected`, `campaignaccounts:${id}`, "primary")],
       [button(`${campaign.intervalSeconds === 300 ? "✓ " : ""}5 min`, `interval:${id}:300`), button(`${campaign.intervalSeconds === 1800 ? "✓ " : ""}30 min`, `interval:${id}:1800`), button(`${campaign.intervalSeconds === 3600 ? "✓ " : ""}60 min`, `interval:${id}:3600`)],
     ];
     if (config.botUsername && inline.contentKind !== "text" && !hasCustomEmoji && !['free', 'starter'].includes((db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from!.id) as { tierCode: string }).tierCode)) rows.push([button(`Posting: ${inline.inlineMode ? "inline" : "direct"} · change`, `inline:${id}`)]);
     rows.push([button(action === "pause" ? "Pause campaign" : "Start campaign", `setcampaign:${id}:${action}`, action === "pause" ? "danger" : "success")]);
     if (campaign.status !== "cancelled") rows.push([button("Cancel campaign", `confirmcancel:${id}`, "link")]);
+    else rows.push([button("Delete campaign", `confirmdeletecampaign:${id}`, "danger", "trash")]);
     rows.push([back("campaigns", "Back to campaigns")]);
     const keyboard = menu(rows);
     await editRich(ctx, `<h2>${escapeHtml(campaign.name)}</h2><p><b>Status:</b> ${campaign.status}<br/><b>Groups:</b> ${targets} ready<br/><b>Frequency:</b> every ${campaign.intervalSeconds / 60} minutes<br/><b>Posting:</b> ${inline.contentKind === "text" ? "connected account" : inline.inlineMode && !hasCustomEmoji ? "inline via connected account" : "connected account copy"}</p><p>${!targets ? "Choose at least one group to start." : campaign.status === "scheduled" ? "This campaign is running. You can pause it or change its groups and frequency." : campaign.status === "cancelled" ? "Stopped. You can start it again." : "Ready to start. The first delivery will be queued when you start it."}</p>`, { parse_mode: "HTML", reply_markup: keyboard });
@@ -363,30 +374,74 @@ export function startAdsBot(db: Database.Database): void {
     await ctx.answerCallbackQuery();
     await showCampaign(ctx, Number(ctx.match[1]));
   });
-  const showCampaignTargets = async (ctx: Context, id: number, requestedPage = 0, notice = "") => {
+  const showCampaignAccounts = async (ctx: Context, id: number, requestedPage = 0) => {
+    const tid = tenantId(ctx.from!.id);
+    if (!db.prepare("SELECT 1 FROM campaigns WHERE tenantId=? AND id=?").get(tid, id)) throw new Error("Campaign not found.");
+    const list = db.prepare(`SELECT a.rowid AS accountRowId,a.accountId,a.phone,a.displayName,a.status,COUNT(ct.chatId) AS selected
+      FROM accounts a LEFT JOIN campaignTargets ct ON ct.tenantId=a.tenantId AND ct.accountId=a.accountId AND ct.campaignId=? AND ct.enabled=1
+      WHERE a.tenantId=? AND (a.status='active' OR ct.chatId IS NOT NULL) GROUP BY a.accountId ORDER BY CASE WHEN a.status='active' THEN 0 ELSE 1 END,a.createdAt DESC`).all(id, tid) as Array<{ accountRowId: number; accountId: string; phone: string | null; displayName: string | null; status: string; selected: number }>;
+    const pageSize = 6, page = Math.min(Math.max(0, requestedPage), Math.max(0, Math.ceil(list.length / pageSize) - 1));
+    const visible = list.slice(page * pageSize, (page + 1) * pageSize);
+    const rows: Button[][] = visible.map((item) => [button(`${item.selected ? "✓ " : ""}${item.displayName || item.phone || "Telegram account"}${item.displayName && item.phone ? ` · ${item.phone}` : ""} · ${item.selected} groups`, `ca:${id}:${item.accountRowId}`)]);
+    if (list.length > pageSize) rows.push([...(page ? [button("Previous", `campaignaccounts:${id}:${page - 1}`, undefined, "prev")] : []), ...(page < Math.ceil(list.length / pageSize) - 1 ? [button("Next", `campaignaccounts:${id}:${page + 1}`, undefined, "next")] : [])]);
+    rows.push([back(`campaign:${id}`, "Back to campaign")]);
+    const summary = visible.map((item) => `<li><b>${escapeHtml(item.displayName || "Telegram account")}</b>${item.phone ? ` · ${escapeHtml(item.phone)}` : ""} · ${item.selected} selected${item.status === "active" ? "" : " · disconnected"}</li>`).join("");
+    await editRich(ctx, `<h2>Accounts & groups</h2><p>Choose each account that should post this campaign. Each account has its own group selection, so the same campaign can reach different groups from different accounts.</p>${summary ? `<ul>${summary}</ul>` : "<p>Connect an account to choose groups.</p>"}`, { parse_mode: "HTML", reply_markup: menu(rows) });
+  };
+  bot.callbackQuery(/^campaignaccounts:(\d+)(?::(\d+))?$/, async (ctx) => { await ctx.answerCallbackQuery(); await showCampaignAccounts(ctx, Number(ctx.match[1]), Number(ctx.match[2] ?? 0)); });
+  bot.callbackQuery(/^ca:(\d+):(\d+)$/, async (ctx) => { await ctx.answerCallbackQuery(); const account = db.prepare("SELECT accountId FROM accounts WHERE rowid=? AND tenantId=?").get(Number(ctx.match[2]), tenantId(ctx.from.id)) as { accountId: string } | undefined; if (!account) return showCampaignAccounts(ctx, Number(ctx.match[1])); await showCampaignTargets(ctx, Number(ctx.match[1]), account.accountId); });
+  const showCampaignTargets = async (ctx: Context, id: number, accountId: string, requestedPage = 0, notice = "") => {
     const tid = tenantId(ctx.from!.id);
     const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tid, id) as { senderAccountId: string } | undefined;
     if (!campaign) throw new Error("Campaign not found.");
+    const account = db.prepare("SELECT rowid AS accountRowId,phone,displayName,status FROM accounts WHERE tenantId=? AND accountId=?").get(tid, accountId) as { accountRowId: number; phone: string | null; displayName: string | null; status: string } | undefined;
+    if (!account) throw new Error("Account not found.");
+    const accountRowId = account.accountRowId;
     const pageSize = 6;
-    const total = (db.prepare("SELECT COUNT(*) AS n FROM groups WHERE tenantId=? AND accountId=? AND chatKind='group'").get(tid, campaign.senderAccountId) as { n: number }).n;
+    const total = (db.prepare("SELECT COUNT(*) AS n FROM groups WHERE tenantId=? AND accountId=? AND chatKind='group'").get(tid, accountId) as { n: number }).n;
     const page = Math.min(Math.max(0, requestedPage), Math.max(0, Math.ceil(total / pageSize) - 1));
     const groups = db.prepare(`SELECT g.rowid AS groupId,g.chatId,g.title,g.enabled AS allowed,ct.enabled AS selected FROM groups g LEFT JOIN campaignTargets ct
       ON ct.tenantId=g.tenantId AND ct.accountId=g.accountId AND ct.chatId=g.chatId AND ct.campaignId=?
       WHERE g.tenantId=? AND g.accountId=? AND g.chatKind='group' ORDER BY g.title LIMIT ? OFFSET ?`)
-      .all(id, tid, campaign.senderAccountId, pageSize, page * pageSize) as Array<{ groupId: number; chatId: string; title: string; allowed: number; selected: number | null }>;
-    const selected = db.prepare(`SELECT g.title FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId WHERE ct.tenantId=? AND ct.campaignId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' ORDER BY g.title`).all(tid, id) as Array<{ title: string }>;
-    const blocked = (db.prepare(`SELECT COUNT(*) AS n FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId WHERE ct.tenantId=? AND ct.campaignId=? AND ct.enabled=1 AND (g.enabled=0 OR g.chatKind!='group')`).get(tid, id) as { n: number }).n;
+      .all(id, tid, accountId, pageSize, page * pageSize) as Array<{ groupId: number; chatId: string; title: string; allowed: number; selected: number | null }>;
+    const selected = db.prepare(`SELECT g.title FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId WHERE ct.tenantId=? AND ct.campaignId=? AND ct.accountId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' ORDER BY g.title`).all(tid, id, accountId) as Array<{ title: string }>;
+    const blocked = (db.prepare(`SELECT COUNT(*) AS n FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId WHERE ct.tenantId=? AND ct.campaignId=? AND ct.accountId=? AND ct.enabled=1 AND (g.enabled=0 OR g.chatKind!='group')`).get(tid, id, accountId) as { n: number }).n;
     const rows: Button[][] = groups.map((group) => [button(`${group.selected && group.allowed ? "" : group.selected ? "⚠ " : "☐ "}${group.title.slice(0, 45)}`, `t:${id}:${group.groupId}:${page}`, group.selected && group.allowed ? "success" : undefined, group.selected && group.allowed ? "check" : undefined)]);
-    if (total > pageSize) rows.push([...(page ? [button("Previous", `campaigntargets:${id}:${page - 1}`, undefined, "prev")] : []), ...(page < Math.ceil(total / pageSize) - 1 ? [button("Next", `campaigntargets:${id}:${page + 1}`, undefined, "next")] : [])]);
-    if (total) rows.push([button("Select all", `alltargets:${id}:${page}`, "success", "check"), ...(selected.length || blocked ? [button("Clear selection", `cleartargets:${id}:${page}`, "link", "cross")] : [])]);
-    rows.push([button("Refresh groups", `campaignrefresh:${id}:${page}`, "link", "refresh")], [back(`campaign:${id}`, "Back to campaign")]);
+    if (total > pageSize) rows.push([...(page ? [button("Previous", `ct:${id}:${accountRowId}:${page - 1}`, undefined, "prev")] : []), ...(page < Math.ceil(total / pageSize) - 1 ? [button("Next", `ct:${id}:${accountRowId}:${page + 1}`, undefined, "next")] : [])]);
+    if (total && account.status === "active") rows.push([button("Select all", `ta:${id}:${accountRowId}:${page}`, "success", "check"), ...(selected.length || blocked ? [button("Clear selection", `tc:${id}:${accountRowId}:${page}`, "link", "cross")] : [])]);
+    rows.push([button("Refresh groups", `tr:${id}:${accountRowId}:${page}`, "link", "refresh")], [back(`campaignaccounts:${id}`, "Back to accounts")]);
     const names = selected.length ? selected.slice(0, 5).map((item) => escapeHtml(item.title)).join(", ") + (selected.length > 5 ? ` and ${selected.length - 5} more` : "") : "None yet";
-    await editRich(ctx, `<h2>Choose groups</h2><p>${notice ? `<b>${escapeHtml(notice)}</b><br/>` : ""}${total ? "Tap a group to select or remove it. The checkboxes update immediately." : "No verified groups yet. Tap Refresh groups to sync this account. Channels are excluded."}</p><p><b>Ready · ${selected.length}</b><br/>${names}${blocked ? `<br/>⚠ ${blocked} selected but blocked. Refresh groups to update access.` : ""}</p><p>Showing ${total ? page * pageSize + 1 : 0}–${Math.min(total, (page + 1) * pageSize)} of ${total} groups.</p>`, { parse_mode: "HTML", reply_markup: menu(rows) });
+    await editRich(ctx, `<h2>Choose groups</h2><p><b>${escapeHtml(account.displayName || "Telegram account")}${account.phone ? ` · ${escapeHtml(account.phone)}` : ""}</b><br/>${notice ? `<b>${escapeHtml(notice)}</b><br/>` : ""}${account.status !== "active" ? "Reconnect this account to update its groups." : total ? "Tap a group to select or remove it. The checkboxes update immediately." : "No verified groups yet. Tap Refresh groups to sync this account. Channels are excluded."}</p><p><b>${account.status === "active" ? "Ready" : "Selected"} · ${selected.length}</b><br/>${names}${blocked ? `<br/>⚠ ${blocked} selected but blocked. Refresh groups to update access.` : ""}</p><p>Showing ${total ? page * pageSize + 1 : 0}–${Math.min(total, (page + 1) * pageSize)} of ${total} groups.</p>`, { parse_mode: "HTML", reply_markup: menu(rows) });
   };
   bot.callbackQuery(/^campaigntargets:(\d+)(?::(\d+))?$/, async (ctx) => {
     await ctx.answerCallbackQuery();
-    try { await showCampaignTargets(ctx, Number(ctx.match[1]), Number(ctx.match[2] ?? 0)); }
+    try { await showCampaignAccounts(ctx, Number(ctx.match[1])); }
     catch (error) { await replyRich(ctx, String(error instanceof Error ? error.message : error), { reply_markup: menu([[back(`campaign:${ctx.match[1]}`, "Back to campaign")]]) }); }
+  });
+  const campaignAccountByRow = (ctx: Context, rowId: number): string => {
+    const row = db.prepare("SELECT accountId FROM accounts WHERE tenantId=? AND rowid=?").get(tenantId(ctx.from!.id), rowId) as { accountId: string } | undefined;
+    if (!row) throw new Error("Account unavailable. Return to the campaign.");
+    return row.accountId;
+  };
+  bot.callbackQuery(/^ct:(\d+):(\d+):(\d+)$/, async (ctx) => { await ctx.answerCallbackQuery(); await showCampaignTargets(ctx, Number(ctx.match[1]), campaignAccountByRow(ctx, Number(ctx.match[2])), Number(ctx.match[3])); });
+  bot.callbackQuery(/^ta:(\d+):(\d+):(\d+)$/, async (ctx) => {
+    const id = Number(ctx.match[1]), accountId = campaignAccountByRow(ctx, Number(ctx.match[2])), page = Number(ctx.match[3]);
+    await ctx.answerCallbackQuery("Selecting all groups");
+    await editRich(ctx, "<h2>Selecting groups</h2><p>Checking which groups this account can post to…</p>", { parse_mode: "HTML", reply_markup: menu([[back(`ct:${id}:${ctx.match[2]}:${page}`, "Back to groups")]]) });
+    try { const result = await selectAllTargets(db, tenantId(ctx.from.id), id, accountId); await showCampaignTargets(ctx, id, accountId, page, `${result.selected} groups selected${result.skipped ? `; ${result.skipped} unavailable skipped` : ""}.`); }
+    catch (error) { await editRich(ctx, `Could not select all groups: ${String(error instanceof Error ? error.message : error)}`, { reply_markup: menu([[back(`ct:${id}:${ctx.match[2]}:${page}`, "Back to groups")]]) }); }
+  });
+  bot.callbackQuery(/^tc:(\d+):(\d+):(\d+)$/, async (ctx) => {
+    const id = Number(ctx.match[1]), accountId = campaignAccountByRow(ctx, Number(ctx.match[2])), page = Number(ctx.match[3]);
+    try { const cleared = clearTargets(db, tenantId(ctx.from.id), id, accountId); await ctx.answerCallbackQuery(`${cleared} groups removed`); await showCampaignTargets(ctx, id, accountId, page); }
+    catch (error) { await ctx.answerCallbackQuery({ text: String(error instanceof Error ? error.message : error), show_alert: true }); }
+  });
+  bot.callbackQuery(/^tr:(\d+):(\d+):(\d+)$/, async (ctx) => {
+    const id = Number(ctx.match[1]), accountId = campaignAccountByRow(ctx, Number(ctx.match[2])), page = Number(ctx.match[3]);
+    await ctx.answerCallbackQuery("Refreshing groups");
+    await editRich(ctx, "Refreshing groups from your connected account…", { reply_markup: menu([[back(`ct:${id}:${ctx.match[2]}:${page}`, "Back to groups")]]) });
+    try { await syncGroups(db, tenantId(ctx.from.id), accountId); await showCampaignTargets(ctx, id, accountId, page); }
+    catch (error) { await editRich(ctx, `Could not refresh groups: ${String(error instanceof Error ? error.message : error)}`, { reply_markup: menu([[back(`ct:${id}:${ctx.match[2]}:${page}`, "Back to groups")]]) }); }
   });
   bot.callbackQuery(/^alltargets:(\d+):(\d+)$/, async (ctx) => {
     const id = Number(ctx.match[1]), page = Number(ctx.match[2]);
@@ -394,7 +449,8 @@ export function startAdsBot(db: Database.Database): void {
     await editRich(ctx, `<h2>Selecting groups</h2><p>Checking which groups this account can post to…</p>`, { parse_mode: "HTML", reply_markup: menu([[back(`campaigntargets:${id}:${page}`, "Back to groups")]]) });
     try {
       const result = await selectAllTargets(db, tenantId(ctx.from.id), id);
-      await showCampaignTargets(ctx, id, page, `${result.selected} groups selected${result.skipped ? `; ${result.skipped} unavailable skipped` : ""}.`);
+      const primary = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tenantId(ctx.from.id), id) as { senderAccountId: string };
+      await showCampaignTargets(ctx, id, primary.senderAccountId, page, `${result.selected} groups selected${result.skipped ? `; ${result.skipped} unavailable skipped` : ""}.`);
     } catch (error) {
       await editRich(ctx, `Could not select all groups: ${String(error instanceof Error ? error.message : error)}`, { reply_markup: menu([[back(`campaigntargets:${id}:${page}`, "Back to groups")]]) });
     }
@@ -404,7 +460,8 @@ export function startAdsBot(db: Database.Database): void {
     try {
       const cleared = clearTargets(db, tenantId(ctx.from.id), id);
       await ctx.answerCallbackQuery(`${cleared} groups removed`);
-      await showCampaignTargets(ctx, id, page);
+      const primary = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tenantId(ctx.from.id), id) as { senderAccountId: string };
+      await showCampaignTargets(ctx, id, primary.senderAccountId, page);
     } catch (error) { await ctx.answerCallbackQuery({ text: String(error instanceof Error ? error.message : error), show_alert: true }); }
   });
   bot.callbackQuery(/^campaignrefresh:(\d+)(?::(\d+))?$/, async (ctx) => {
@@ -413,7 +470,7 @@ export function startAdsBot(db: Database.Database): void {
     const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tid, id) as { senderAccountId: string } | undefined;
     if (!campaign) return replyRich(ctx, "Campaign not found.", { reply_markup: menu([[back("campaigns", "Back to campaigns")]]) });
     await editRich(ctx, "Refreshing groups from your connected account…", { reply_markup: menu([[back(`campaign:${id}`, "Back to campaign")]]) });
-    try { await syncGroups(db, tid, campaign.senderAccountId); await showCampaignTargets(ctx, id, Number(ctx.match[2] ?? 0)); }
+    try { await syncGroups(db, tid, campaign.senderAccountId); await showCampaignTargets(ctx, id, campaign.senderAccountId, Number(ctx.match[2] ?? 0)); }
     catch (error) { await replyRich(ctx, `Could not refresh groups: ${String(error instanceof Error ? error.message : error)}`, { reply_markup: menu([[back(`campaign:${id}`, "Back to campaign")]]) }); }
   });
   bot.callbackQuery(/^interval:(\d+):(300|1800|3600)$/, async (ctx) => {
@@ -452,6 +509,21 @@ export function startAdsBot(db: Database.Database): void {
     if (!campaign) return replyRich(ctx, "Campaign not found.", { reply_markup: menu([[back("campaigns", "Back to campaigns")]]) });
     await editRich(ctx, `<h2>Stop campaign?</h2><p><b>${escapeHtml(campaign.name)}</b> will stop sending and pending deliveries will be skipped. You can start it again later.</p>`, { parse_mode: "HTML", reply_markup: menu([[button("Stop campaign", `setcampaign:${id}:cancel`, "danger", "cross")], [back(`campaign:${id}`, "Back to campaign")]]) });
   });
+  bot.callbackQuery(/^confirmdeletecampaign:(\d+)$/, async (ctx) => {
+    const id = Number(ctx.match[1]);
+    const campaign = db.prepare("SELECT name FROM campaigns WHERE tenantId=? AND id=? AND status='cancelled'").get(tenantId(ctx.from.id), id) as { name: string } | undefined;
+    await ctx.answerCallbackQuery();
+    if (!campaign) return showCampaigns(ctx);
+    await editRich(ctx, `<h2>Delete campaign?</h2><p><b>${escapeHtml(campaign.name)}</b>, its group selections, and its delivery history will be removed permanently.</p>`, { parse_mode: "HTML", reply_markup: menu([[button("Delete campaign", `deletecampaign:${id}`, "danger", "trash")], [back(`campaign:${id}`, "Back to campaign")]]) });
+  });
+  bot.callbackQuery(/^deletecampaign:(\d+)$/, async (ctx) => {
+    const id = Number(ctx.match[1]);
+    const campaign = db.prepare("SELECT 1 FROM campaigns WHERE tenantId=? AND id=? AND status='cancelled'").get(tenantId(ctx.from.id), id);
+    if (!campaign) return ctx.answerCallbackQuery({ text: "Stop the campaign before deleting it.", show_alert: true });
+    deleteCampaign(db, tenantId(ctx.from.id), id);
+    await ctx.answerCallbackQuery("Campaign deleted");
+    await showCampaigns(ctx);
+  });
   const showGroups = async (ctx: Context, accountId: string, requestedPage = 0, origin: "account" | "groups" = "account") => {
     const tid = tenantId(ctx.from!.id);
     const account = accounts(db, tid).find((item) => item.accountId === accountId && item.status === "active");
@@ -463,7 +535,7 @@ export function startAdsBot(db: Database.Database): void {
     const rows: Button[][] = groups.map((group) => [button(`${group.enabled ? "" : "☐ "}${group.title.slice(0, 45)}`, `g:${group.groupId}:${group.enabled ? 0 : 1}:${page}:${origin}`, group.enabled ? "success" : undefined, group.enabled ? "check" : undefined)]);
     if (summary.total > pageSize) rows.push([...(page ? [button("Previous", `groupsof:${accountId}:${page - 1}:${origin}`, undefined, "prev")] : []), ...(page < Math.ceil(summary.total / pageSize) - 1 ? [button("Next", `groupsof:${accountId}:${page + 1}:${origin}`, undefined, "next")] : [])]);
     rows.push([button("Sync from Telegram", `groupsync:${accountId}:${page}:${origin}`, "link", "refresh")], [origin === "groups" ? back("groups", "Back to groups") : back(`account:${accountId}`, "Back to account")]);
-    await editRich(ctx, `<h2>Groups</h2><p><b>${escapeHtml(account.phone ?? "Telegram account")}</b><br/>${summary.enabled ?? 0} enabled of ${summary.total} verified groups.</p><p>${summary.total ? "Tap to allow or block delivery to a group. Campaigns choose their own targets from enabled groups." : "No verified groups yet. Tap Sync from Telegram to load groups. Channels are excluded."}</p><p>Showing ${summary.total ? page * pageSize + 1 : 0}–${Math.min(summary.total, (page + 1) * pageSize)} of ${summary.total}.</p>`, { parse_mode: "HTML", reply_markup: menu(rows) });
+    await editRich(ctx, `<h2>Groups</h2><p><b>${escapeHtml(accountLabel(account))}</b><br/>${summary.enabled ?? 0} enabled of ${summary.total} verified groups.</p><p>${summary.total ? "Tap to allow or block delivery to a group. Campaigns choose their own targets from enabled groups." : "No verified groups yet. Tap Sync from Telegram to load groups. Channels are excluded."}</p><p>Showing ${summary.total ? page * pageSize + 1 : 0}–${Math.min(summary.total, (page + 1) * pageSize)} of ${summary.total}.</p>`, { parse_mode: "HTML", reply_markup: menu(rows) });
   };
   bot.callbackQuery("groups", async (ctx) => {
     const list = accounts(db, tenantId(ctx.from.id)).filter((a) => a.status === "active");
@@ -533,24 +605,24 @@ export function startAdsBot(db: Database.Database): void {
       await replyRich(ctx, `<b>Pay $${amount} · ${method}</b>\n\n${address}\n\n${method === "Binance" ? "Send USDT with Binance Pay." : "Send USDT on the selected network."}\nThen send the Order ID or transaction hash here. This request expires in 30 minutes.`, { parse_mode: "HTML", reply_markup: menu([[back(`upgrade:${tier}`, "Back to payment methods")]]) });
   });
   bot.callbackQuery("home", async (ctx) => { flows.delete(ctx.from.id); await ctx.answerCallbackQuery(); await showHome(ctx); });
-  const toggleTarget = async (ctx: Context, campaignId: number, chatId: string, page: number) => {
+  const toggleTarget = async (ctx: Context, campaignId: number, accountId: string, chatId: string, page: number) => {
     try {
       const tid = tenantId(ctx.from!.id);
       const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId = ? AND id = ?").get(tid, campaignId) as { senderAccountId: string } | undefined;
       if (!campaign) throw new Error("campaign not found");
-      const group = db.prepare("SELECT enabled FROM groups WHERE tenantId=? AND accountId=? AND chatId=? AND chatKind='group'").get(tid, campaign.senderAccountId, chatId) as { enabled: number } | undefined;
+      const group = db.prepare("SELECT enabled FROM groups WHERE tenantId=? AND accountId=? AND chatId=? AND chatKind='group'").get(tid, accountId, chatId) as { enabled: number } | undefined;
       if (!group) throw new Error("Group unavailable. Refresh the list.");
       const tier = (db.prepare("SELECT tierCode FROM tenants WHERE tenantId = ?").get(tid) as { tierCode: string }).tierCode;
-      const current = db.prepare("SELECT enabled FROM campaignTargets WHERE tenantId=? AND campaignId=? AND chatId=?").get(tid, campaignId, chatId) as { enabled: number } | undefined;
+      const current = db.prepare("SELECT enabled FROM campaignTargets WHERE tenantId=? AND campaignId=? AND accountId=? AND chatId=?").get(tid, campaignId, accountId, chatId) as { enabled: number } | undefined;
       if (current?.enabled && group.enabled) {
-        updateTarget(db, tid, campaignId, chatId, false);
+        updateTarget(db, tid, campaignId, chatId, false, accountId);
         await ctx.answerCallbackQuery("Group removed");
       } else {
-        await setGroup(db, tid, campaign.senderAccountId, chatId, true, undefined, tier === "business" ? 2 : tier === "pro" ? 1 : 0);
-        await addTarget(db, tid, campaignId, chatId);
+        await setGroup(db, tid, accountId, chatId, true, undefined, tier === "business" ? 2 : tier === "pro" ? 1 : 0);
+        await addTarget(db, tid, campaignId, chatId, accountId);
         await ctx.answerCallbackQuery("Group selected");
       }
-      await showCampaignTargets(ctx, campaignId, page);
+      await showCampaignTargets(ctx, campaignId, accountId, page);
     } catch (error) {
       await ctx.answerCallbackQuery({ text: String(error instanceof Error ? error.message : error), show_alert: true });
     }
@@ -558,13 +630,14 @@ export function startAdsBot(db: Database.Database): void {
   bot.callbackQuery(/^t:(\d+):(\d+):(\d+)$/, async (ctx) => {
     const id = Number(ctx.match[1]);
     const tid = tenantId(ctx.from.id);
-    const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tid, id) as { senderAccountId: string } | undefined;
-    const group = campaign && db.prepare("SELECT chatId FROM groups WHERE rowid=? AND tenantId=? AND accountId=? AND chatKind='group'").get(Number(ctx.match[2]), tid, campaign.senderAccountId) as { chatId: string } | undefined;
+    const group = db.prepare("SELECT chatId,accountId FROM groups WHERE rowid=? AND tenantId=? AND chatKind='group'").get(Number(ctx.match[2]), tid) as { chatId: string; accountId: string } | undefined;
     if (!group) return ctx.answerCallbackQuery({ text: "Group unavailable. Refresh the list.", show_alert: true });
-    await toggleTarget(ctx, id, group.chatId, Number(ctx.match[3]));
+    await toggleTarget(ctx, id, group.accountId, group.chatId, Number(ctx.match[3]));
   });
   bot.callbackQuery(/^target:(\d+):([^:]+)$/, async (ctx) => {
-    await toggleTarget(ctx, Number(ctx.match[1]), ctx.match[2]!, 0);
+    const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tenantId(ctx.from.id), Number(ctx.match[1])) as { senderAccountId: string } | undefined;
+    if (!campaign) return ctx.answerCallbackQuery({ text: "Campaign not found", show_alert: true });
+    await toggleTarget(ctx, Number(ctx.match[1]), campaign.senderAccountId, ctx.match[2]!, 0);
   });
   bot.on("message:text", async (ctx, next) => {
     const flow = flows.get(ctx.from.id);
@@ -631,6 +704,9 @@ export function startAdsBot(db: Database.Database): void {
           } else if (flow.action === "password" && !flow.code && /PHONE_CODE_INVALID|not waiting for a login code/i.test(String(error))) {
             flows.set(ctx.from.id, { ...flow, action: "code" });
             await editRichAt(ctx, progress.message_id, "The login session resumed after a restart. Send the Telegram code again, or cancel to request a new one.", { reply_markup: menu([[loginBack(ctx.from.id)]]) });
+          } else if (String(error).toUpperCase().includes("ALREADY CONNECTED")) {
+            flows.delete(ctx.from.id);
+            await editRichAt(ctx, progress.message_id, `<b>Already connected</b><br/>${loginError(error)}`, { parse_mode: "HTML", reply_markup: menu([[back("accounts", "Back to accounts")]]) });
           } else {
             flows.set(ctx.from.id, { ...flow, action: flow.action === "password" ? "password" : "code", code: flow.action === "password" ? flow.code : code });
              await editRichAt(ctx, progress.message_id, `❌ <b>Login failed</b>\n\n${loginError(error)}\n\nTry again or cancel to start over.`, { parse_mode: "HTML", reply_markup: menu([[loginBack(ctx.from.id)]]) });
@@ -660,7 +736,9 @@ export function startAdsBot(db: Database.Database): void {
           throw error;
         }
         flows.delete(ctx.from.id);
-        await replyRich(ctx, `${payment.tierCode} is active until ${new Date(paidUntil).toLocaleDateString()}.`, { reply_markup: home() });
+        const list = accounts(db, tenantId(ctx.from.id));
+        const primary = list.some((item) => item.status === "active") ? "campaign" : list.some((item) => item.phone) ? "accounts" : "connect";
+        await replyRich(ctx, `${payment.tierCode} is active until ${new Date(paidUntil).toLocaleDateString()}.`, { reply_markup: home(primary) });
       }
     } catch (error) {
       if (["phone", "sending_code"].includes(flows.get(ctx.from.id)?.action ?? "")) {
@@ -689,7 +767,7 @@ export function startAdsBot(db: Database.Database): void {
       db.prepare("UPDATE campaigns SET messageEntities = ?, sourceChatId = ?, sourceMessageId = ?, richMessage = ?, contentKind=?, inlineMode = ? WHERE id = ? AND tenantId = ?")
         .run(JSON.stringify(entities), archived ? config.archiveChat || String(ctx.from.id) : null, archived?.message_id ?? null, inlineMedia ? JSON.stringify(inlineMedia) : null, msg.text ? "text" : "media", archived && inlineMedia && config.botUsername && !hasCustomEmoji ? 1 : 0, created.id, tid);
       flows.delete(ctx.from.id);
-      await showCampaignTargets(ctx, created.id);
+      await showCampaignAccounts(ctx, created.id);
     } catch (error) {
       await replyRich(ctx, `Could not save this campaign: ${escapeHtml(String(error instanceof Error ? error.message : error))}`, { parse_mode: "HTML", reply_markup: menu([[back("newcampaign:back", "Back to campaigns")]]) });
     }
