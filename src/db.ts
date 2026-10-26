@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE INDEX IF NOT EXISTS accounts_tenant ON accounts(tenantId);
 CREATE TABLE IF NOT EXISTS groups (
   tenantId TEXT NOT NULL, accountId TEXT NOT NULL, chatId TEXT NOT NULL, title TEXT NOT NULL, username TEXT,
-  enabled INTEGER NOT NULL DEFAULT 0, messageOverride TEXT, lastSentAt TEXT,
+  enabled INTEGER NOT NULL DEFAULT 0, chatKind TEXT NOT NULL DEFAULT 'unknown', messageOverride TEXT, lastSentAt TEXT,
   createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, PRIMARY KEY (tenantId, accountId, chatId),
   FOREIGN KEY (tenantId, accountId) REFERENCES accounts(tenantId, accountId) ON DELETE CASCADE
 );
@@ -92,10 +92,13 @@ export function openDb(path: string): Database.Database {
   if (!accountColumns.some((column) => column.name === "sendAfter")) db.exec("ALTER TABLE accounts ADD COLUMN sendAfter TEXT");
   const groupColumns = db.prepare("PRAGMA table_info(groups)").all() as Array<{ name: string }>;
   if (!groupColumns.some((column) => column.name === "lastSeenSync")) db.exec("ALTER TABLE groups ADD COLUMN lastSeenSync TEXT");
+  if (!groupColumns.some((column) => column.name === "chatKind")) db.exec("ALTER TABLE groups ADD COLUMN chatKind TEXT NOT NULL DEFAULT 'unknown'");
   if (!accountColumns.some((column) => column.name === "sessionType")) {
     db.exec("ALTER TABLE accounts ADD COLUMN sessionType TEXT NOT NULL DEFAULT 'gramjs'");
   }
-  const migrated = db.prepare("SELECT tenantId, accountId FROM accounts WHERE session IS NOT NULL AND session NOT LIKE 'tdlib:%'").all() as Array<{ tenantId: string; accountId: string }>;
+  // Sessions are encrypted, so their ciphertext cannot be tested for the tdlib: prefix.
+  // Only rows explicitly marked as legacy GramJS sessions need invalidation.
+  const migrated = db.prepare("SELECT tenantId, accountId FROM accounts WHERE session IS NOT NULL AND sessionType = 'gramjs'").all() as Array<{ tenantId: string; accountId: string }>;
   db.transaction(() => {
     for (const account of migrated) {
       db.prepare("UPDATE accounts SET session = NULL, status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, sessionType = 'tdlib', updatedAt = ? WHERE tenantId = ? AND accountId = ?").run(new Date().toISOString(), account.tenantId, account.accountId);
@@ -134,8 +137,8 @@ function migrateLegacyAccounts(db: Database.Database): void {
     db.exec("ALTER TABLE deliveries RENAME TO deliveries_legacy; ALTER TABLE campaignTargets RENAME TO campaignTargets_legacy; ALTER TABLE campaigns RENAME TO campaigns_legacy; ALTER TABLE groups RENAME TO groups_legacy; ALTER TABLE accounts RENAME TO accounts_legacy;");
     db.exec("DROP INDEX IF EXISTS campaigns_due; DROP INDEX IF EXISTS deliveries_limits;");
     db.exec(DDL);
-    db.exec(`INSERT INTO accounts (accountId, tenantId, ownerId, phone, telegramUserId, session, status, loginPhone, phoneCodeHash, createdAt, updatedAt)
-      SELECT 'legacy:' || tenantId, tenantId, ownerId, phone, telegramUserId, session, status, loginPhone, phoneCodeHash, createdAt, updatedAt FROM accounts_legacy`);
+    db.exec(`INSERT INTO accounts (accountId, tenantId, ownerId, phone, telegramUserId, session, sessionType, status, loginPhone, phoneCodeHash, createdAt, updatedAt)
+      SELECT 'legacy:' || tenantId, tenantId, ownerId, phone, telegramUserId, session, 'gramjs', status, loginPhone, phoneCodeHash, createdAt, updatedAt FROM accounts_legacy`);
     db.exec(`INSERT INTO groups (tenantId, accountId, chatId, title, username, enabled, messageOverride, lastSentAt, createdAt, updatedAt)
       SELECT tenantId, 'legacy:' || tenantId, chatId, title, username, enabled, messageOverride, lastSentAt, createdAt, updatedAt FROM groups_legacy`);
     db.exec(`INSERT INTO campaigns (id, tenantId, name, senderAccountId, message, status, intervalSeconds, dailyLimit, accountCooldownSeconds, groupCooldownSeconds, nextRunAt, createdAt, updatedAt)

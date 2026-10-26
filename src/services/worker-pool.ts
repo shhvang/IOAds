@@ -91,6 +91,7 @@ export function remoteAdapterFor(accountId: string): TelegramAdapter | null {
   return {
     sendCode: (phone: string) => call(accountId, "sendCode", [phone]),
     signIn: (phone: string, hash: string, code: string, password?: string) => call(accountId, "signIn", [phone, hash, code, password]),
+    resumeSession: () => call(accountId, "resumeSession", []),
     dialogs: (): Promise<TelegramDialog[]> => call(accountId, "dialogs", []),
     canPost: (chatId: string) => call(accountId, "canPost", [chatId]),
     sendMessage: (chatId: string, message: string, entities?: Array<Record<string, unknown>>) => call(accountId, "sendMessage", [chatId, message, entities]),

@@ -1,12 +1,15 @@
 import type { Context } from "grammy";
 import type { RichMessageButton } from "grammy/types";
+import { icons, type IconName } from "./bot-icons.js";
 
-export type Button = RichMessageButton;
+export type Button = RichMessageButton & { icon?: IconName };
 export type ButtonRows = Button[][];
 
-export function button(text: string, callback_data: string, style?: "primary" | "success" | "danger" | "link"): Button {
-  return { text, callback_data, ...(style ? { style } : {}) };
+export function button(text: string, callback_data: string, style?: "primary" | "success" | "danger" | "link", icon?: IconName): Button {
+  return { text, callback_data, ...(style ? { style } : {}), ...(icon ? { icon } : {}) };
 }
+
+export function back(to: string, label = "Back"): Button { return button(label, to, "link", "back"); }
 
 export function menu(rows: ButtonRows): ButtonRows { return rows; }
 
@@ -31,8 +34,9 @@ export function richHtml(content: string, rows: ButtonRows = [], isHtml = false)
   const controls = rows.filter((row) => row.length).map((row) => {
     const buttons = row.map((item) => {
       const style = item.style ? ` style="${item.style}"` : "";
-      if ("callback_data" in item) return `<tg-button type="callback_data" data="${escapeHtml(item.callback_data)}"${style}>${escapeHtml(item.text)}</tg-button>`;
-      if ("url" in item) return `<tg-button type="url" url="${escapeHtml(item.url)}"${style}>${escapeHtml(item.text)}</tg-button>`;
+      const icon = item.icon ? `<tg-emoji emoji-id="${icons[item.icon][0]}">${icons[item.icon][1]}</tg-emoji> ` : "";
+      if ("callback_data" in item) return `<tg-button type="callback_data" data="${escapeHtml(item.callback_data)}"${style}>${icon}${escapeHtml(item.text)}</tg-button>`;
+      if ("url" in item) return `<tg-button type="url" url="${escapeHtml(item.url)}"${style}>${icon}${escapeHtml(item.text)}</tg-button>`;
       throw new Error("Unsupported rich button");
     }).join("");
     return `<tg-button-row>${buttons}</tg-button-row>`;

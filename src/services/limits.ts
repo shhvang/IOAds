@@ -36,14 +36,18 @@ export function limitFor(db: Database.Database, tenantId: string, key: keyof Lim
 export function enforceTenantLimits(db: Database.Database, tenantId: string): void {
   const limits = tenantLimits(db, tenantId);
   db.transaction(() => {
-    db.prepare(`UPDATE groups SET enabled = 0, updatedAt = datetime('now') WHERE tenantId = ? AND enabled = 1 AND rowid NOT IN
-      (SELECT rowid FROM groups WHERE tenantId = ? AND enabled = 1 ORDER BY rowid LIMIT ?)`).run(tenantId, tenantId, limits.groups);
+    db.prepare(`UPDATE groups SET enabled = 0, updatedAt = datetime('now') WHERE tenantId = ? AND enabled = 1 AND chatKind='group' AND rowid NOT IN
+      (SELECT rowid FROM groups WHERE tenantId = ? AND enabled = 1 AND chatKind='group' ORDER BY rowid LIMIT ?)`).run(tenantId, tenantId, limits.groups);
     db.prepare(`UPDATE campaigns SET status = 'paused', updatedAt = datetime('now') WHERE tenantId = ? AND status IN ('draft', 'scheduled', 'paused') AND id NOT IN
       (SELECT id FROM campaigns WHERE tenantId = ? ORDER BY id LIMIT ?)`).run(tenantId, tenantId, limits.campaigns);
     const campaigns = db.prepare("SELECT id FROM campaigns WHERE tenantId = ?").all(tenantId) as Array<{ id: number }>;
     for (const campaign of campaigns) db.prepare(`UPDATE campaignTargets SET enabled = 0, updatedAt = datetime('now') WHERE campaignId = ? AND tenantId = ? AND enabled = 1 AND chatId NOT IN
       (SELECT chatId FROM campaignTargets WHERE campaignId = ? AND tenantId = ? AND enabled = 1 ORDER BY chatId LIMIT ?)`).run(campaign.id, tenantId, campaign.id, tenantId, limits.targets);
-    db.prepare(`UPDATE accounts SET status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = datetime('now') WHERE tenantId = ? AND rowid NOT IN
-      (SELECT rowid FROM accounts WHERE tenantId = ? ORDER BY createdAt, rowid LIMIT ?)`).run(tenantId, tenantId, limits.accounts);
+    const connected = db.prepare("SELECT accountId,status FROM accounts WHERE tenantId=? AND status IN ('active','limit_paused') AND session IS NOT NULL ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, createdAt, accountId")
+      .all(tenantId) as Array<{ accountId: string; status: string }>;
+    for (const [index, account] of connected.entries()) {
+      const status = index < limits.accounts ? "active" : "limit_paused";
+      if (account.status !== status) db.prepare("UPDATE accounts SET status=?,updatedAt=? WHERE tenantId=? AND accountId=?").run(status, new Date().toISOString(), tenantId, account.accountId);
+    }
   })();
 }

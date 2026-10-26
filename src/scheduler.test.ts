@@ -13,7 +13,7 @@ db.prepare("INSERT INTO tenants (tenantId,productId,ownerId,state,tierCode,runti
 db.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,session,status,createdAt,updatedAt) VALUES ('sender','large',1,'fake','active',?,?)")
   .run(time, time);
 const created = createCampaign(db, "large", { name: "many groups", message: "hello", senderAccountId: "sender", intervalSeconds: 300 }) as { id: number };
-const addGroup = db.prepare("INSERT INTO groups (tenantId,accountId,chatId,title,enabled,createdAt,updatedAt) VALUES ('large','sender',?,?,1,?,?)");
+const addGroup = db.prepare("INSERT INTO groups (tenantId,accountId,chatId,title,enabled,chatKind,createdAt,updatedAt) VALUES ('large','sender',?,?,1,'group',?,?)");
 const addTarget = db.prepare("INSERT INTO campaignTargets (campaignId,tenantId,accountId,chatId,createdAt,updatedAt) VALUES (?,'large','sender',?,?,?)");
 for (let i = 0; i < 35; i += 1) {
   const chatId = `-${1000 + i}`;
@@ -33,7 +33,7 @@ assert.equal((db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE campaignId=
 
 db.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,session,status,createdAt,updatedAt) VALUES ('flaky','large',1,'fake','active',?,?)")
   .run(time, time);
-db.prepare("INSERT INTO groups (tenantId,accountId,chatId,title,enabled,createdAt,updatedAt) VALUES ('large','flaky','-999','Flaky',1,?,?)").run(time, time);
+db.prepare("INSERT INTO groups (tenantId,accountId,chatId,title,enabled,chatKind,createdAt,updatedAt) VALUES ('large','flaky','-999','Flaky',1,'group',?,?)").run(time, time);
 const retryCampaign = createCampaign(db, "large", { name: "retry", message: "retry me", senderAccountId: "flaky", intervalSeconds: 300 }) as { id: number };
 db.prepare("INSERT INTO campaignTargets (campaignId,tenantId,accountId,chatId,createdAt,updatedAt) VALUES (?,'large','flaky','-999',?,?)")
   .run(retryCampaign.id, time, time);

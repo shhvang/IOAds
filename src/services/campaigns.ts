@@ -51,7 +51,7 @@ export function setCampaignStatus(db: Database.Database, tenantId: string, id: n
     requireAccount(db, tenantId, current.senderAccountId, true);
     const target = db.prepare(`SELECT 1 FROM campaignTargets ct JOIN groups g
       ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId
-      WHERE ct.tenantId=? AND ct.campaignId=? AND ct.accountId=? AND ct.enabled=1 AND g.enabled=1 LIMIT 1`)
+      WHERE ct.tenantId=? AND ct.campaignId=? AND ct.accountId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' LIMIT 1`)
       .get(tenantId, id, current.senderAccountId);
     if (!target) throw new Error("Choose at least one enabled group before scheduling this campaign.");
   }
@@ -69,7 +69,7 @@ export async function addTarget(db: Database.Database, tenantId: string, id: num
   if (!current) throw new Error("campaign not found");
   requireAccount(db, tenantId, current.senderAccountId, true);
   if (typeof chatId !== "string" || !chatId || chatId.length > 100) throw new Error("invalid chatId");
-  const group = db.prepare("SELECT enabled FROM groups WHERE tenantId = ? AND accountId = ? AND chatId = ?").get(tenantId, current.senderAccountId, chatId) as { enabled: number } | undefined;
+  const group = db.prepare("SELECT enabled FROM groups WHERE tenantId = ? AND accountId = ? AND chatId = ? AND chatKind='group'").get(tenantId, current.senderAccountId, chatId) as { enabled: number } | undefined;
   if (!group) throw new Error("group not found for sender account");
   if (chatId === config.archiveChat) throw new Error("the archive chat cannot be a campaign target");
   if (!group.enabled && !(await adapterFor(db, tenantId, current.senderAccountId).canPost(chatId))) throw new Error("selected account cannot post to this group");
@@ -83,7 +83,7 @@ export async function selectAllTargets(db: Database.Database, tenantId: string, 
   const current = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tenantId, id) as { senderAccountId: string } | undefined;
   if (!current) throw new Error("campaign not found");
   requireAccount(db, tenantId, current.senderAccountId, true);
-  const groups = db.prepare("SELECT chatId,enabled FROM groups WHERE tenantId=? AND accountId=? ORDER BY title").all(tenantId, current.senderAccountId) as Array<{ chatId: string; enabled: number }>;
+  const groups = db.prepare("SELECT chatId,enabled FROM groups WHERE tenantId=? AND accountId=? AND chatKind='group' ORDER BY title").all(tenantId, current.senderAccountId) as Array<{ chatId: string; enabled: number }>;
   const adapter = adapterFor(db, tenantId, current.senderAccountId);
   const allowed: string[] = [];
   let skipped = 0;
@@ -100,7 +100,7 @@ export async function selectAllTargets(db: Database.Database, tenantId: string, 
   const count = db.prepare("SELECT COUNT(*) AS n FROM campaignTargets WHERE tenantId=? AND campaignId=?").get(tenantId, id) as { n: number };
   const existing = new Set((db.prepare("SELECT chatId FROM campaignTargets WHERE tenantId=? AND campaignId=?").all(tenantId, id) as Array<{ chatId: string }>).map((row) => row.chatId));
   if (count.n + allowed.filter((chatId) => !existing.has(chatId)).length > limitFor(db, tenantId, "targets")) throw new Error("target limit reached");
-  const enabledGroups = (db.prepare("SELECT COUNT(*) AS n FROM groups WHERE tenantId=? AND enabled=1").get(tenantId) as { n: number }).n;
+  const enabledGroups = (db.prepare("SELECT COUNT(*) AS n FROM groups WHERE tenantId=? AND enabled=1 AND chatKind='group'").get(tenantId) as { n: number }).n;
   const disabled = new Set(groups.filter((group) => !group.enabled).map((group) => group.chatId));
   const enableCount = allowed.filter((chatId) => disabled.has(chatId)).length;
   if (enabledGroups + enableCount > limitFor(db, tenantId, "groups")) throw new Error("enabled group limit reached");
@@ -122,6 +122,6 @@ export function clearTargets(db: Database.Database, tenantId: string, id: number
   if (changed) writeAudit(db, tenantId, "targets_cleared", { campaignId: id, count: changed });
   return changed;
 }
-export function updateTarget(db: Database.Database, tenantId: string, id: number, chatId: string, enabled: unknown): void { if (typeof enabled !== "boolean") throw new Error("enabled must be boolean"); const result = db.prepare("UPDATE campaignTargets SET enabled = ?, updatedAt = ? WHERE campaignId = ? AND tenantId = ? AND chatId = ?").run(enabled ? 1 : 0, now(), id, tenantId, chatId); if (!result.changes) throw new Error("target not found"); writeAudit(db, tenantId, enabled ? "target_enabled" : "target_disabled", { campaignId: id, chatId }); }
+export function updateTarget(db: Database.Database, tenantId: string, id: number, chatId: string, enabled: unknown): void { if (typeof enabled !== "boolean") throw new Error("enabled must be boolean"); if (enabled && !db.prepare("SELECT 1 FROM groups WHERE tenantId=? AND chatId=? AND chatKind='group'").get(tenantId, chatId)) throw new Error("group not found"); const result = db.prepare("UPDATE campaignTargets SET enabled = ?, updatedAt = ? WHERE campaignId = ? AND tenantId = ? AND chatId = ?").run(enabled ? 1 : 0, now(), id, tenantId, chatId); if (!result.changes) throw new Error("target not found"); writeAudit(db, tenantId, enabled ? "target_enabled" : "target_disabled", { campaignId: id, chatId }); }
 export function deleteTarget(db: Database.Database, tenantId: string, id: number, chatId: string): void { db.prepare("DELETE FROM campaignTargets WHERE campaignId = ? AND tenantId = ? AND chatId = ?").run(id, tenantId, chatId); writeAudit(db, tenantId, "target_deleted", { campaignId: id, chatId }); }
 export function detail(db: Database.Database, tenantId: string, id: number): unknown { const row = campaign(db, tenantId, id); return row ? { ...(row as object), targets: db.prepare("SELECT * FROM campaignTargets WHERE tenantId = ? AND campaignId = ?").all(tenantId, id) } : undefined; }

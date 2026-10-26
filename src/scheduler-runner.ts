@@ -35,6 +35,7 @@ function account(tenantId: string, accountId: string): TelegramAdapter {
   return {
     sendCode: (phone) => invoke("sendCode", [phone]),
     signIn: (phone, hash, code, password) => invoke("signIn", [phone, hash, code, password]),
+    resumeSession: () => invoke("resumeSession", []),
     dialogs: () => invoke("dialogs", []),
     canPost: (chatId) => invoke("canPost", [chatId]),
     sendMessage: (chatId, message, entities) => invoke("sendMessage", [chatId, message, entities]),
