@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS tenants (
 );
 CREATE INDEX IF NOT EXISTS tenants_owner ON tenants(ownerId);
 CREATE TABLE IF NOT EXISTS localUsers (telegramId INTEGER PRIMARY KEY, tenantId TEXT NOT NULL UNIQUE, tierCode TEXT NOT NULL DEFAULT 'free', paidUntil TEXT, forceJoined INTEGER NOT NULL DEFAULT 0, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS botFlows (telegramId INTEGER PRIMARY KEY, data TEXT NOT NULL, updatedAt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS planPayments (id INTEGER PRIMARY KEY, telegramId INTEGER NOT NULL, tierCode TEXT NOT NULL, network TEXT NOT NULL, amount REAL NOT NULL, reference TEXT NOT NULL UNIQUE, externalId TEXT UNIQUE, createdAt TEXT NOT NULL, expiresAt TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS accounts (
   accountId TEXT PRIMARY KEY, tenantId TEXT NOT NULL, ownerId INTEGER NOT NULL, phone TEXT, telegramUserId INTEGER,
@@ -35,7 +36,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
   senderAccountId TEXT NOT NULL,
   message TEXT NOT NULL, messageEntities TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'draft', intervalSeconds INTEGER NOT NULL,
   dailyLimit INTEGER NOT NULL DEFAULT 0, accountCooldownSeconds INTEGER NOT NULL DEFAULT 0,
-  groupCooldownSeconds INTEGER NOT NULL DEFAULT 0, nextRunAt TEXT, promoNextAt TEXT, inlineMode INTEGER NOT NULL DEFAULT 0, sourceChatId TEXT, sourceMessageId INTEGER, richMessage TEXT, createdAt TEXT NOT NULL,
+  groupCooldownSeconds INTEGER NOT NULL DEFAULT 0, nextRunAt TEXT, promoNextAt TEXT, inlineMode INTEGER NOT NULL DEFAULT 0, sourceChatId TEXT, sourceMessageId INTEGER, richMessage TEXT, contentKind TEXT NOT NULL DEFAULT 'legacy', createdAt TEXT NOT NULL,
   updatedAt TEXT NOT NULL, FOREIGN KEY (tenantId) REFERENCES tenants(tenantId) ON DELETE CASCADE,
   FOREIGN KEY (tenantId, senderAccountId) REFERENCES accounts(tenantId, accountId)
 );
@@ -54,6 +55,13 @@ CREATE TABLE IF NOT EXISTS deliveries (
   FOREIGN KEY (tenantId, accountId, chatId) REFERENCES groups(tenantId, accountId, chatId) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS deliveries_limits ON deliveries(tenantId, status, sentAt);
+CREATE TABLE IF NOT EXISTS promoDeliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, campaignId INTEGER NOT NULL, tenantId TEXT NOT NULL,
+  occurrenceKey TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+  nextAttemptAt TEXT, claimedAt TEXT, sentAt TEXT, error TEXT, createdAt TEXT NOT NULL,
+  FOREIGN KEY (campaignId) REFERENCES campaigns(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS promo_deliveries_due ON promoDeliveries(status, nextAttemptAt, id);
 CREATE TABLE IF NOT EXISTS tombstones (tenantId TEXT PRIMARY KEY, version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS rentalSyncState (id INTEGER PRIMARY KEY CHECK (id = 1), lastSeq INTEGER NOT NULL DEFAULT 0, cursor INTEGER, mode TEXT, seen TEXT NOT NULL DEFAULT '[]', updatedAt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (
@@ -73,10 +81,17 @@ export function openDb(path: string): Database.Database {
   const columns = db.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === "occurrenceKey")) db.exec("ALTER TABLE deliveries ADD COLUMN occurrenceKey TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS deliveries_occurrence ON deliveries(occurrenceKey) WHERE occurrenceKey IS NOT NULL");
+  if (!columns.some((column) => column.name === "nextAttemptAt")) db.exec("ALTER TABLE deliveries ADD COLUMN nextAttemptAt TEXT");
+  db.exec("UPDATE promoDeliveries SET status='skipped',error='automatic bot broadcast disabled',claimedAt=NULL WHERE status IN ('pending','retry','claimed')");
+  db.exec("CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(status, nextAttemptAt, id)");
+  db.exec("CREATE INDEX IF NOT EXISTS deliveries_account_claim ON deliveries(accountId, status, claimedAt)");
   const tenantColumns = db.prepare("PRAGMA table_info(tenants)").all() as Array<{ name: string }>;
   if (!tenantColumns.some((column) => column.name === "controlBotFingerprint")) db.exec("ALTER TABLE tenants ADD COLUMN controlBotFingerprint TEXT");
   if (!tenantColumns.some((column) => column.name === "controlBotToken")) db.exec("ALTER TABLE tenants ADD COLUMN controlBotToken TEXT");
   const accountColumns = db.prepare("PRAGMA table_info(accounts)").all() as Array<{ name: string }>;
+  if (!accountColumns.some((column) => column.name === "sendAfter")) db.exec("ALTER TABLE accounts ADD COLUMN sendAfter TEXT");
+  const groupColumns = db.prepare("PRAGMA table_info(groups)").all() as Array<{ name: string }>;
+  if (!groupColumns.some((column) => column.name === "lastSeenSync")) db.exec("ALTER TABLE groups ADD COLUMN lastSeenSync TEXT");
   if (!accountColumns.some((column) => column.name === "sessionType")) {
     db.exec("ALTER TABLE accounts ADD COLUMN sessionType TEXT NOT NULL DEFAULT 'gramjs'");
   }
@@ -95,6 +110,8 @@ export function openDb(path: string): Database.Database {
   if (!campaignColumns.some((column) => column.name === "sourceChatId")) db.exec("ALTER TABLE campaigns ADD COLUMN sourceChatId TEXT");
   if (!campaignColumns.some((column) => column.name === "sourceMessageId")) db.exec("ALTER TABLE campaigns ADD COLUMN sourceMessageId INTEGER");
   if (!campaignColumns.some((column) => column.name === "richMessage")) db.exec("ALTER TABLE campaigns ADD COLUMN richMessage TEXT");
+  if (!campaignColumns.some((column) => column.name === "contentKind")) db.exec("ALTER TABLE campaigns ADD COLUMN contentKind TEXT NOT NULL DEFAULT 'legacy'");
+  db.exec("UPDATE campaigns SET contentKind='text',inlineMode=0 WHERE contentKind='legacy' AND inlineMode=1 AND richMessage IS NULL AND message!='[Telegram media or rich message]' AND tenantId IN (SELECT tenantId FROM localUsers)");
   const paymentColumns = db.prepare("PRAGMA table_info(planPayments)").all() as Array<{ name: string }>;
   const paymentNames = new Set(paymentColumns.map((column) => column.name));
   if (!paymentNames.has("network")) db.exec("ALTER TABLE planPayments ADD COLUMN network TEXT NOT NULL DEFAULT 'Binance'");

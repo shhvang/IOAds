@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { now } from "../db.js";
+import { config } from "../config.js";
 import { adapterFor, requireAccount } from "./account.js";
 import { writeAudit } from "./audit.js";
 import { limitFor } from "./limits.js";
@@ -21,7 +22,7 @@ function campaign(db: Database.Database, tenantId: string, id: number): unknown 
 export function listCampaigns(db: Database.Database, tenantId: string): unknown[] { return db.prepare("SELECT * FROM campaigns WHERE tenantId = ? ORDER BY id DESC").all(tenantId); }
 
 export function createCampaign(db: Database.Database, tenantId: string, input: { name: string; message: string; senderAccountId: string; intervalSeconds?: number; dailyLimit?: number; accountCooldownSeconds?: number; groupCooldownSeconds?: number }): unknown {
-  if (Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId = ?").get(tenantId) as { n: number }).n) >= limitFor(db, tenantId, "campaigns")) throw new Error("campaign limit reached");
+  if (Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId = ? AND status != 'cancelled'").get(tenantId) as { n: number }).n) >= limitFor(db, tenantId, "campaigns")) throw new Error("campaign limit reached");
   const name = text(input.name, "name", 120), message = text(input.message, "message", 4096), senderAccountId = sender(db, tenantId, input.senderAccountId);
   const intervalSeconds = integer(input.intervalSeconds ?? 3600, "intervalSeconds", 300, 3600), dailyLimit = integer(input.dailyLimit ?? 0, "dailyLimit", 0, 1_000_000), accountCooldownSeconds = integer(input.accountCooldownSeconds ?? 0, "accountCooldownSeconds", 0, 31_536_000), groupCooldownSeconds = integer(input.groupCooldownSeconds ?? 0, "groupCooldownSeconds", 0, 31_536_000);
   const result = db.prepare(`INSERT INTO campaigns (tenantId, name, senderAccountId, message, intervalSeconds, dailyLimit, accountCooldownSeconds, groupCooldownSeconds, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(tenantId, name, senderAccountId, message, intervalSeconds, dailyLimit, accountCooldownSeconds, groupCooldownSeconds, now(), now());
@@ -42,14 +43,36 @@ export function updateCampaign(db: Database.Database, tenantId: string, id: numb
   return campaign(db, tenantId, id);
 }
 export function deleteCampaign(db: Database.Database, tenantId: string, id: number): void { db.prepare("DELETE FROM campaigns WHERE tenantId = ? AND id = ?").run(tenantId, id); writeAudit(db, tenantId, "campaign_deleted", { id }); }
-export function setCampaignStatus(db: Database.Database, tenantId: string, id: number, status: "scheduled" | "paused" | "cancelled"): void { if (!campaign(db, tenantId, id)) throw new Error("campaign not found"); db.prepare("UPDATE campaigns SET status = ?, nextRunAt = CASE WHEN ? = 'scheduled' THEN COALESCE(nextRunAt, ?) ELSE nextRunAt END, updatedAt = ? WHERE tenantId = ? AND id = ?").run(status, status, now(), now(), tenantId, id); writeAudit(db, tenantId, `campaign_${status}`, { id }); }
+export function setCampaignStatus(db: Database.Database, tenantId: string, id: number, status: "scheduled" | "paused" | "cancelled"): void {
+  const current = campaign(db, tenantId, id) as { senderAccountId: string; status: string } | undefined;
+  if (!current) throw new Error("campaign not found");
+  if (status === "scheduled") {
+    if (current.status === "cancelled" && Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId=? AND id!=? AND status!='cancelled'").get(tenantId, id) as { n: number }).n) >= limitFor(db, tenantId, "campaigns")) throw new Error("campaign limit reached");
+    requireAccount(db, tenantId, current.senderAccountId, true);
+    const target = db.prepare(`SELECT 1 FROM campaignTargets ct JOIN groups g
+      ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId
+      WHERE ct.tenantId=? AND ct.campaignId=? AND ct.accountId=? AND ct.enabled=1 AND g.enabled=1 LIMIT 1`)
+      .get(tenantId, id, current.senderAccountId);
+    if (!target) throw new Error("Choose at least one enabled group before scheduling this campaign.");
+  }
+  db.transaction(() => {
+    db.prepare("UPDATE campaigns SET status=?, nextRunAt=CASE WHEN ?='scheduled' AND ?!='scheduled' THEN ? ELSE nextRunAt END, updatedAt=? WHERE tenantId=? AND id=?")
+      .run(status, status, current.status, now(), now(), tenantId, id);
+    if (status === "cancelled") {
+      db.prepare("UPDATE deliveries SET status='skipped',error='campaign cancelled' WHERE tenantId=? AND campaignId=? AND status IN ('pending','retry')").run(tenantId, id);
+    }
+  })();
+  writeAudit(db, tenantId, `campaign_${status}`, { id });
+}
 export async function addTarget(db: Database.Database, tenantId: string, id: number, chatId: string): Promise<void> {
   const current = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId = ? AND id = ?").get(tenantId, id) as { senderAccountId: string } | undefined;
   if (!current) throw new Error("campaign not found");
   requireAccount(db, tenantId, current.senderAccountId, true);
   if (typeof chatId !== "string" || !chatId || chatId.length > 100) throw new Error("invalid chatId");
-  if (!db.prepare("SELECT 1 FROM groups WHERE tenantId = ? AND accountId = ? AND chatId = ?").get(tenantId, current.senderAccountId, chatId)) throw new Error("group not found for sender account");
-  if (!(await adapterFor(db, tenantId, current.senderAccountId).canPost(chatId))) throw new Error("selected account cannot post to this group");
+  const group = db.prepare("SELECT enabled FROM groups WHERE tenantId = ? AND accountId = ? AND chatId = ?").get(tenantId, current.senderAccountId, chatId) as { enabled: number } | undefined;
+  if (!group) throw new Error("group not found for sender account");
+  if (chatId === config.archiveChat) throw new Error("the archive chat cannot be a campaign target");
+  if (!group.enabled && !(await adapterFor(db, tenantId, current.senderAccountId).canPost(chatId))) throw new Error("selected account cannot post to this group");
   db.transaction(() => {
     if (!db.prepare("SELECT 1 FROM campaignTargets WHERE tenantId = ? AND campaignId = ? AND chatId = ?").get(tenantId, id, chatId) && Number((db.prepare("SELECT COUNT(*) AS n FROM campaignTargets WHERE tenantId = ? AND campaignId = ?").get(tenantId, id) as { n: number }).n) >= limitFor(db, tenantId, "targets")) throw new Error("target limit reached");
     db.prepare("INSERT INTO campaignTargets (campaignId, tenantId, accountId, chatId, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(campaignId, chatId) DO UPDATE SET enabled=1, updatedAt=excluded.updatedAt").run(id, tenantId, current.senderAccountId, chatId, now(), now());

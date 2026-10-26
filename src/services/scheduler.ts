@@ -1,101 +1,152 @@
 import type Database from "better-sqlite3";
+import { config } from "../config.js";
 import { now } from "../db.js";
 import { adapterFor } from "./account.js";
 import type { TelegramAdapter } from "../telegram.js";
 import { tierRank } from "./plans.js";
 import { tenantLimits } from "./limits.js";
 
-const accountLocks = new Map<string, Promise<void>>();
-async function sendSerial(key: string, send: () => Promise<void>): Promise<void> {
-  const previous = accountLocks.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => { release = resolve; });
-  accountLocks.set(key, current);
-  await previous;
-  try { await send(); } finally { release(); if (accountLocks.get(key) === current) accountLocks.delete(key); }
+const LEASE_MS = 120_000;
+type Delivery = { id: number; tenantId: string; campaignId: number; accountId: string; chatId: string; attempts: number;
+  message: string; messageEntities: string; messageOverride: string | null; sourceChatId: string | null;
+  sourceMessageId: number | null; inlineMode: number; contentKind: string; tierCode: string; groupCooldownSeconds: number;
+  accountCooldownSeconds: number; lastSentAt: string | null };
+
+const nextDay = (): string => {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1)).toISOString();
+};
+
+function planDeliveries(db: Database.Database): void {
+  db.prepare("UPDATE deliveries SET status='skipped',error='target disabled' WHERE status IN ('pending','retry') AND (NOT EXISTS (SELECT 1 FROM groups g WHERE g.tenantId=deliveries.tenantId AND g.accountId=deliveries.accountId AND g.chatId=deliveries.chatId AND g.enabled=1) OR NOT EXISTS (SELECT 1 FROM campaignTargets ct WHERE ct.campaignId=deliveries.campaignId AND ct.chatId=deliveries.chatId AND ct.enabled=1))").run();
+  const due = db.prepare("SELECT c.id FROM campaigns c JOIN tenants t ON t.tenantId=c.tenantId LEFT JOIN localUsers u ON u.tenantId=c.tenantId WHERE c.status='scheduled' AND (c.nextRunAt IS NULL OR c.nextRunAt<=?) AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) ORDER BY c.nextRunAt,c.id LIMIT 1000").all(now()) as Array<{ id: number }>;
+  const plan = db.transaction((id: number) => {
+    const c = db.prepare("SELECT c.*,t.state,t.runtime,t.suspendReason,u.forceJoined FROM campaigns c JOIN tenants t ON t.tenantId=c.tenantId LEFT JOIN localUsers u ON u.tenantId=c.tenantId WHERE c.id=?").get(id) as Record<string, unknown> | undefined;
+    if (!c || c.status !== "scheduled" || c.state !== "active" || c.runtime !== "service" || c.suspendReason === "blocked" || c.forceJoined === 0) return;
+    const time = now();
+    if (c.nextRunAt && String(c.nextRunAt) > time) return;
+    const busy = db.prepare("SELECT 1 FROM deliveries WHERE campaignId=? AND status IN ('pending','retry','claimed') LIMIT 1").get(id);
+    db.prepare("UPDATE campaigns SET nextRunAt=?,updatedAt=? WHERE id=?").run(new Date(Date.now() + Number(c.intervalSeconds) * 1000).toISOString(), time, id);
+    if (busy) return; // Keep one occurrence outstanding instead of accumulating an unbounded backlog.
+    const occurrence = `${id}:${c.nextRunAt ?? time}`;
+    db.prepare("INSERT OR IGNORE INTO deliveries (tenantId,campaignId,chatId,accountId,occurrenceKey,status,attempts,nextAttemptAt,createdAt) SELECT ct.tenantId,ct.campaignId,ct.chatId,ct.accountId,? || ':' || ct.accountId || ':' || ct.chatId,'pending',0,?,? FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId WHERE ct.campaignId=? AND ct.tenantId=? AND ct.accountId=? AND ct.enabled=1 AND g.enabled=1")
+      .run(occurrence, time, time, id, c.tenantId, c.senderAccountId);
+  });
+  for (const row of due) plan(row.id);
 }
 
-export async function runSchedulerOnce(db: Database.Database, adapterForAccount: (tenantId: string, accountId: string) => TelegramAdapter = (tenantId, accountId) => adapterFor(db, tenantId, accountId), copyMessage?: (chatId: string, sourceChatId: string, messageId: number) => Promise<void>): Promise<number> {
-  const campaigns = db.prepare(`SELECT c.*, t.tierCode, t.state, t.runtime, t.suspendReason, u.forceJoined FROM campaigns c JOIN tenants t ON t.tenantId = c.tenantId
-    LEFT JOIN localUsers u ON u.tenantId = c.tenantId
-    WHERE c.status = 'scheduled' AND (c.nextRunAt IS NULL OR c.nextRunAt <= ?) ORDER BY c.id`).all(now()) as Array<Record<string, unknown>>;
-  let sent = 0;
-  const maxPerPass = 25;
-  const accountSentAt = new Map<string, number>();
-  const tenantPassSent = new Map<string, number>();
-  for (const campaign of campaigns) {
-    if (campaign.state !== "active" || campaign.runtime !== "service" || campaign.suspendReason === "blocked" || campaign.forceJoined === 0) continue;
-    const tenantId = String(campaign.tenantId), accountId = String(campaign.senderAccountId), limits = tenantLimits(db, tenantId);
-    const targets = db.prepare(`SELECT g.chatId, g.messageOverride, g.lastSentAt FROM campaignTargets ct JOIN groups g ON g.tenantId = ct.tenantId AND g.accountId = ct.accountId AND g.chatId = ct.chatId
-      WHERE ct.tenantId = ? AND ct.campaignId = ? AND ct.accountId = ? AND ct.enabled = 1 AND g.enabled = 1 ORDER BY g.chatId`).all(tenantId, campaign.id, accountId) as Array<Record<string, unknown>>;
-    const daily = Math.min(Number(campaign.dailyLimit), limits.dailyMessages);
-    const sentToday = Number((db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE tenantId = ? AND status = 'sent' AND sentAt >= date('now')").get(tenantId) as { n: number }).n);
-    const campaignSentToday = Number((db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE tenantId = ? AND campaignId = ? AND status = 'sent' AND sentAt >= date('now')").get(tenantId, campaign.id) as { n: number }).n);
-    if (sentToday + (tenantPassSent.get(tenantId) ?? 0) >= limits.dailyMessages || (daily > 0 && campaignSentToday >= daily)) continue;
-    const account = db.prepare("SELECT status, session FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { status: string; session: string | null } | undefined;
-    if (account?.status !== "active" || !account.session) continue;
-    const lastAccountSend = db.prepare("SELECT MAX(sentAt) AS sentAt FROM deliveries WHERE tenantId = ? AND accountId = ? AND status = 'sent'").get(tenantId, accountId) as { sentAt: string | null };
-    const accountKey = `${tenantId}:${accountId}`, lastAccountAt = Math.max(lastAccountSend.sentAt ? Date.parse(lastAccountSend.sentAt) : 0, accountSentAt.get(accountKey) ?? 0);
-    if (lastAccountAt && Number(campaign.accountCooldownSeconds) > 0 && Date.now() - lastAccountAt < Number(campaign.accountCooldownSeconds) * 1000) continue;
-    let accountSent = false, campaignPassSent = 0, retryAt: string | null = null;
-    for (const target of targets) {
-      if (sent >= maxPerPass || accountSent) break;
-      const currentTenant = db.prepare("SELECT tierCode, state, runtime, suspendReason FROM tenants WHERE tenantId = ?").get(tenantId) as { tierCode: string; state: string; runtime: string; suspendReason: string | null } | undefined;
-      const currentAccount = db.prepare("SELECT status, session FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { status: string; session: string | null } | undefined;
-      if (!currentTenant || currentTenant.state !== "active" || currentTenant.runtime !== "service" || currentTenant.suspendReason === "blocked" || currentAccount?.status !== "active" || !currentAccount.session) break;
-       const message = tierRank(currentTenant.tierCode) >= 1 && target.messageOverride ? String(target.messageOverride) : String(campaign.message);
-      const last = target.lastSentAt ? Date.parse(String(target.lastSentAt)) : 0;
-      if (Number(campaign.groupCooldownSeconds) > 0 && Date.now() - last < Number(campaign.groupCooldownSeconds) * 1000) continue;
-      const retry = db.prepare("SELECT occurrenceKey FROM deliveries WHERE campaignId = ? AND chatId = ? AND accountId = ? AND status = 'retry' ORDER BY id DESC LIMIT 1").get(campaign.id, target.chatId, accountId) as { occurrenceKey: string } | undefined;
-      const occurrenceKey = retry?.occurrenceKey ?? `${campaign.id}:${accountId}:${target.chatId}:${campaign.nextRunAt ?? "initial"}`;
-      db.prepare("UPDATE deliveries SET status = 'retry' WHERE occurrenceKey = ? AND status = 'claimed' AND claimedAt < ?").run(occurrenceKey, new Date(Date.now() - 15 * 60 * 1000).toISOString());
-      const claimed = db.prepare(`INSERT OR IGNORE INTO deliveries (tenantId, campaignId, chatId, accountId, occurrenceKey, status, attempts, claimedAt, createdAt) VALUES (?, ?, ?, ?, ?, 'claimed', 1, ?, ?)`).run(tenantId, campaign.id, target.chatId, accountId, occurrenceKey, now(), now());
-      if (!claimed.changes && !db.prepare("UPDATE deliveries SET status = 'claimed', attempts = attempts + 1, claimedAt = ?, error = NULL WHERE occurrenceKey = ? AND status = 'retry'").run(now(), occurrenceKey).changes) continue;
-      const delivery = db.prepare("SELECT id FROM deliveries WHERE occurrenceKey = ?").get(occurrenceKey) as { id: number };
-      try {
-        const entities = JSON.parse(String(campaign.messageEntities ?? "[]")) as Array<Record<string, unknown>>;
-        await sendSerial(accountKey, () => Number(campaign.inlineMode)
-          ? adapterForAccount(tenantId, accountId).sendInline(String(target.chatId), `campaign:${campaign.id}`)
-          : tierRank(currentTenant.tierCode) === 0 && copyMessage && campaign.sourceChatId && campaign.sourceMessageId
-            ? copyMessage(String(target.chatId), String(campaign.sourceChatId), Number(campaign.sourceMessageId))
-            : campaign.sourceChatId && campaign.sourceMessageId
-              ? adapterForAccount(tenantId, accountId).copyMessage(String(target.chatId), String(campaign.sourceChatId), Number(campaign.sourceMessageId))
-              : adapterForAccount(tenantId, accountId).sendMessage(String(target.chatId), message, entities));
-        db.prepare("UPDATE deliveries SET status = 'sent', sentAt = ? WHERE id = ?").run(now(), delivery.id);
-        db.prepare("UPDATE groups SET lastSentAt = ?, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND chatId = ?").run(now(), now(), tenantId, accountId, target.chatId);
-        sent += 1; campaignPassSent += 1; tenantPassSent.set(tenantId, (tenantPassSent.get(tenantId) ?? 0) + 1); accountSent = Number(campaign.accountCooldownSeconds) > 0; accountSentAt.set(accountKey, Date.now());
-      } catch (error) {
-        const text = String(error), flood = /(?:flood_wait[_ ](\d+)|wait(?: of)?\s+(\d+))/i.exec(text);
-        if (flood) { const seconds = Number(flood[1] ?? flood[2] ?? 60); retryAt = new Date(Date.now() + seconds * 1000).toISOString(); db.prepare("UPDATE deliveries SET status = 'retry', error = ? WHERE id = ?").run(`flood wait ${seconds}s`, delivery.id); }
-        else db.prepare("UPDATE deliveries SET status = 'failed', error = ? WHERE id = ?").run(text.slice(0, 500), delivery.id);
-      }
-      if (sentToday + (tenantPassSent.get(tenantId) ?? 0) >= limits.dailyMessages || (daily > 0 && campaignSentToday + campaignPassSent >= daily)) break;
+function claimDelivery(db: Database.Database): Delivery | "deferred" | null {
+  return db.transaction(() => {
+    const time = now();
+    const candidate = db.prepare("SELECT d.id,d.tenantId,d.campaignId,c.dailyLimit FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN tenants t ON t.tenantId=d.tenantId JOIN accounts a ON a.accountId=d.accountId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN campaignTargets ct ON ct.campaignId=d.campaignId AND ct.chatId=d.chatId LEFT JOIN localUsers u ON u.tenantId=d.tenantId WHERE d.status IN ('pending','retry') AND (d.nextAttemptAt IS NULL OR d.nextAttemptAt<=?) AND c.status='scheduled' AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) AND a.status='active' AND a.session IS NOT NULL AND (a.sendAfter IS NULL OR a.sendAfter<=?) AND g.enabled=1 AND ct.enabled=1 AND NOT EXISTS (SELECT 1 FROM deliveries active WHERE active.accountId=d.accountId AND active.status='claimed') ORDER BY d.nextAttemptAt,d.id LIMIT 1")
+      .get(time, time) as { id: number; tenantId: string; campaignId: number; dailyLimit: number } | undefined;
+    if (!candidate) return null;
+    const limits = tenantLimits(db, candidate.tenantId);
+    const day = time.slice(0, 10);
+    const count = (campaignId?: number): number => (db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE tenantId=? AND (? IS NULL OR campaignId=?) AND ((status='sent' AND sentAt>=?) OR (status='claimed' AND claimedAt>=?))")
+      .get(candidate.tenantId, campaignId ?? null, campaignId ?? null, day, day) as { n: number }).n;
+    if (count() >= limits.dailyMessages || (candidate.dailyLimit > 0 && count(candidate.campaignId) >= candidate.dailyLimit)) {
+      db.prepare("UPDATE deliveries SET status='retry',nextAttemptAt=? WHERE id=?").run(nextDay(), candidate.id);
+      return "deferred";
     }
-    db.prepare("UPDATE campaigns SET nextRunAt = ?, updatedAt = ? WHERE id = ? AND tenantId = ?").run(retryAt ?? new Date(Date.now() + Number(campaign.intervalSeconds) * 1000).toISOString(), now(), campaign.id, tenantId);
-  }
-  return sent;
+    db.prepare("UPDATE deliveries SET status='claimed',attempts=attempts+1,claimedAt=?,error=NULL WHERE id=?").run(time, candidate.id);
+    return db.prepare("SELECT d.id,d.tenantId,d.campaignId,d.accountId,d.chatId,d.attempts,c.message,c.messageEntities,c.sourceChatId,c.sourceMessageId,c.inlineMode,c.contentKind,c.groupCooldownSeconds,c.accountCooldownSeconds,g.messageOverride,g.lastSentAt,t.tierCode FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN tenants t ON t.tenantId=d.tenantId WHERE d.id=?")
+      .get(candidate.id) as Delivery;
+  })();
 }
 
-export async function runPromoOnce(db: Database.Database, send: (message: string, entities: Array<Record<string, unknown>>, sourceChatId: string | null, sourceMessageId: number | null) => Promise<void>): Promise<number> {
-  const due = db.prepare(`SELECT c.id, c.tenantId, c.message, c.messageEntities, c.sourceChatId, c.sourceMessageId FROM campaigns c JOIN tenants t ON t.tenantId = c.tenantId
-    JOIN localUsers u ON u.tenantId = c.tenantId WHERE c.status = 'scheduled' AND t.state = 'active' AND u.forceJoined = 1
-    AND (c.promoNextAt IS NULL OR c.promoNextAt <= ?) ORDER BY c.id LIMIT 10`).all(now()) as Array<{ id: number; tenantId: string; message: string; messageEntities: string; sourceChatId: string | null; sourceMessageId: number | null }>;
-  for (const campaign of due) {
-    const entities = JSON.parse(campaign.messageEntities) as Array<Record<string, unknown>>;
+function retrySeconds(error: unknown, attempts: number): number | null {
+  const message = String(error);
+  const flood = /FLOOD_(?:PREMIUM_)?WAIT[_ ](\d+)|retry.after[^0-9]*(\d+)|wait(?: of)?\s+(\d+)/i.exec(message);
+  if (flood) return Math.min(86_400, Number(flood[1] ?? flood[2] ?? flood[3]) + 1);
+  if (/timeout|network|connection|ECONN|EPIPE|socket|worker.*unavailable|worker.*exited|\b5\d\d\b|INTERNAL/i.test(message))
+    return Math.min(3600, 5 * 2 ** Math.min(attempts - 1, 9)) + Math.floor(Math.random() * 5);
+  return null;
+}
+
+async function deliver(db: Database.Database, d: Delivery, getAdapter: (tenantId: string, accountId: string) => TelegramAdapter): Promise<boolean> {
+  const last = d.lastSentAt ? Date.parse(d.lastSentAt) : 0;
+  if (last && d.groupCooldownSeconds > 0 && Date.now() - last < d.groupCooldownSeconds * 1000) {
+    db.prepare("UPDATE deliveries SET status='retry',nextAttemptAt=?,claimedAt=NULL WHERE id=? AND status='claimed'")
+      .run(new Date(last + d.groupCooldownSeconds * 1000).toISOString(), d.id);
+    return false;
+  }
+  try {
+    const message = tierRank(d.tierCode) >= 1 && d.messageOverride ? d.messageOverride : d.message;
+    const entities = JSON.parse(d.messageEntities || "[]") as Array<Record<string, unknown>>;
+    const hasCustomEmoji = entities.some((entity) => entity.type === "custom_emoji");
+    if (d.messageOverride && tierRank(d.tierCode) >= 1) await getAdapter(d.tenantId, d.accountId).sendMessage(d.chatId, message, []);
+    else if (d.contentKind === "text") await getAdapter(d.tenantId, d.accountId).sendMessage(d.chatId, message, entities);
+    else if (d.inlineMode && !hasCustomEmoji) await getAdapter(d.tenantId, d.accountId).sendInline(d.chatId, `campaign:${d.campaignId}`);
+    else if (d.sourceChatId && d.sourceMessageId) await getAdapter(d.tenantId, d.accountId).copyMessage(d.chatId, d.sourceChatId, d.sourceMessageId, hasCustomEmoji);
+    else await getAdapter(d.tenantId, d.accountId).sendMessage(d.chatId, message, entities);
+    const time = now();
+    db.transaction(() => {
+      db.prepare("UPDATE deliveries SET status='sent',sentAt=?,claimedAt=NULL WHERE id=? AND status='claimed'").run(time, d.id);
+      db.prepare("UPDATE groups SET lastSentAt=?,updatedAt=? WHERE tenantId=? AND accountId=? AND chatId=?").run(time, time, d.tenantId, d.accountId, d.chatId);
+      if (d.accountCooldownSeconds > 0) db.prepare("UPDATE accounts SET sendAfter=? WHERE tenantId=? AND accountId=?")
+        .run(new Date(Date.now() + d.accountCooldownSeconds * 1000).toISOString(), d.tenantId, d.accountId);
+    })();
+    return true;
+  } catch (error) {
+    const delay = retrySeconds(error, d.attempts);
+    db.transaction(() => {
+      db.prepare("UPDATE deliveries SET status=?,nextAttemptAt=?,claimedAt=NULL,error=? WHERE id=? AND status='claimed'")
+        .run(delay === null ? "failed" : "retry", delay === null ? null : new Date(Date.now() + delay * 1000).toISOString(), String(error).slice(0, 500), d.id);
+      if (String(error).includes("needs Premium to send custom emoji"))
+        db.prepare("UPDATE campaigns SET status='paused',updatedAt=? WHERE id=? AND status='scheduled'").run(now(), d.campaignId);
+      if (delay !== null && /FLOOD|retry.after|wait(?: of)?\s+\d+/i.test(String(error)))
+        db.prepare("UPDATE accounts SET sendAfter=? WHERE tenantId=? AND accountId=?")
+          .run(new Date(Date.now() + delay * 1000).toISOString(), d.tenantId, d.accountId);
+    })();
+    return false;
+  }
+}
+
+export async function runSchedulerOnce(db: Database.Database, getAdapter: (tenantId: string, accountId: string) => TelegramAdapter = (tenantId, accountId) => adapterFor(db, tenantId, accountId)): Promise<number> {
+  planDeliveries(db);
+  db.prepare("UPDATE deliveries SET status='retry',nextAttemptAt=?,claimedAt=NULL WHERE status='claimed' AND claimedAt<?")
+    .run(now(), new Date(Date.now() - LEASE_MS).toISOString());
+  const jobs: Delivery[] = [];
+  for (let i = 0; i < config.deliveryConcurrency * 4 && jobs.length < config.deliveryConcurrency; i += 1) {
+    const job = claimDelivery(db);
+    if (!job) break;
+    if (job !== "deferred") jobs.push(job);
+  }
+  const results = await Promise.allSettled(jobs.map((job) => deliver(db, job, getAdapter)));
+  return results.filter((result) => result.status === "fulfilled" && result.value).length;
+}
+
+export function startDeliveryPump(db: Database.Database, getAdapter: (tenantId: string, accountId: string) => TelegramAdapter, intervalMs: number): () => void {
+  let active = 0;
+  let planningAt = 0;
+  let pumping = false;
+  let stopped = false;
+  const pump = () => {
+    if (stopped || pumping) return;
+    pumping = true;
     try {
-      await send(campaign.message, entities, campaign.sourceChatId, campaign.sourceMessageId);
-      db.prepare("UPDATE campaigns SET promoNextAt = ? WHERE id = ? AND tenantId = ?").run(new Date(Date.now() + 600_000).toISOString(), campaign.id, campaign.tenantId);
-    } catch (error) {
-      console.error(`ads promo send failed: ${String(error)}`);
-      db.prepare("UPDATE campaigns SET promoNextAt = ? WHERE id = ? AND tenantId = ?").run(new Date(Date.now() + 600_000).toISOString(), campaign.id, campaign.tenantId);
-    }
-  }
-  return due.length;
-}
-
-export function startScheduler(db: Database.Database, intervalMs: number, copyMessage?: (target: string, source: string, messageId: number) => Promise<void>): void {
-  let busy = false;
-  const run = async () => { if (busy) return; busy = true; try { await runSchedulerOnce(db, undefined, copyMessage); } finally { busy = false; } };
-  void run();
-  setInterval(() => void run(), intervalMs).unref();
+      if (Date.now() - planningAt >= intervalMs) {
+        planDeliveries(db);
+        db.prepare("UPDATE deliveries SET status='retry',nextAttemptAt=?,claimedAt=NULL WHERE status='claimed' AND claimedAt<?")
+          .run(now(), new Date(Date.now() - LEASE_MS).toISOString());
+        planningAt = Date.now();
+      }
+      let skipped = 0;
+      while (active < config.deliveryConcurrency && skipped < config.deliveryConcurrency * 4) {
+        const job = claimDelivery(db);
+        if (!job) break;
+        if (job === "deferred") { skipped += 1; continue; }
+        active += 1;
+        void deliver(db, job, getAdapter)
+          .catch((error) => console.error(`ads delivery ${job.id} failed: ${String(error)}`))
+          .finally(() => { active -= 1; if (!stopped) setImmediate(pump); });
+      }
+    } catch (error) { console.error(`ads scheduler pump failed: ${String(error)}`); }
+    finally { pumping = false; }
+  };
+  const timer = setInterval(pump, intervalMs);
+  timer.unref();
+  pump();
+  return () => { stopped = true; clearInterval(timer); };
 }

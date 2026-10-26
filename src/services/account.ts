@@ -4,12 +4,14 @@ import { config } from "../config.js";
 import { now } from "../db.js";
 import { seal } from "../lib/crypto.js";
 import { createTelegramAdapter, type TelegramAdapter } from "../telegram.js";
+import { remoteAdapterFor } from "./worker-pool.js";
 import { limitFor } from "./limits.js";
 
 const adapters = new Map<string, TelegramAdapter>();
+const testAdapters = new Map<string, TelegramAdapter>();
 const key = (tenantId: string, accountId: string): string => `${tenantId}:${accountId}`;
 
-export function setAdapterForTest(tenantId: string, accountId: string, adapter: TelegramAdapter): void { adapters.set(key(tenantId, accountId), adapter); }
+export function setAdapterForTest(tenantId: string, accountId: string, adapter: TelegramAdapter): void { testAdapters.set(key(tenantId, accountId), adapter); }
 
 export function forgetAdapter(tenantId: string, accountId?: string): void {
   const entries = [...adapters.entries()].filter(([adapterKey]) => adapterKey.startsWith(`${tenantId}:`) && (!accountId || adapterKey === key(tenantId, accountId)));
@@ -17,6 +19,7 @@ export function forgetAdapter(tenantId: string, accountId?: string): void {
     adapters.delete(adapterKey);
     void adapter.logout().catch(() => undefined);
   }
+  for (const testKey of [...testAdapters.keys()]) if (testKey.startsWith(`${tenantId}:`) && (!accountId || testKey === key(tenantId, accountId))) testAdapters.delete(testKey);
 }
 
 export function accounts(db: Database.Database, tenantId: string): Array<{ accountId: string; status: string; phone: string | null; telegramUserId: number | null }> {
@@ -44,6 +47,8 @@ export function requireAccount(db: Database.Database, tenantId: string, accountI
 
 export function adapterFor(db: Database.Database, tenantId: string, accountId: string): TelegramAdapter {
   const adapterKey = key(tenantId, accountId);
+  const injected = testAdapters.get(adapterKey);
+  if (injected) return injected;
   const row = db.prepare("SELECT status, session FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { status: string; session: string | null } | undefined;
   if (!row) throw new Error("account not found");
   const cached = adapters.get(adapterKey);
@@ -52,34 +57,34 @@ export function adapterFor(db: Database.Database, tenantId: string, accountId: s
     adapters.delete(adapterKey);
     void cached.logout().catch(() => undefined);
   }
-  const adapter = createTelegramAdapter(accountId);
+  const adapter = remoteAdapterFor(accountId) ?? createTelegramAdapter(accountId);
   adapters.set(adapterKey, adapter);
   return adapter;
 }
 
 export async function loginStart(db: Database.Database, tenantId: string, phone: string, requestedAccountId?: string): Promise<{ accountId: string; sent: true }> {
-  console.log(`[loginStart] tenantId=${tenantId}, phone=${phone.slice(0,4)}***, requestedAccountId=${requestedAccountId}`);
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before login");
   const accountId = requestedAccountId ?? randomUUID();
-  console.log(`[loginStart] using accountId=${accountId}`);
   const owned = db.prepare("SELECT tenantId, status FROM accounts WHERE accountId = ?").get(accountId) as { tenantId: string; status: string } | undefined;
   if (owned && owned.tenantId !== tenantId) throw new Error("account not found");
   if (owned?.status === "active") throw new Error("account is already active");
-   if (Number((db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE tenantId = ? AND (status = 'active' OR status = 'connecting')").get(tenantId) as { n: number }).n) >= limitFor(db, tenantId, "accounts")) throw new Error("account limit reached");
+  if (Number((db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE tenantId = ? AND accountId != ? AND (status = 'active' OR status = 'connecting')").get(tenantId, accountId) as { n: number }).n) >= limitFor(db, tenantId, "accounts")) throw new Error("account limit reached");
+  if (owned?.status === "connecting") await cancelLogin(db, tenantId, accountId);
+  else if (owned) {
+    const previous = adapters.get(key(tenantId, accountId)) ?? remoteAdapterFor(accountId);
+    await previous?.logout().catch(() => undefined);
+    adapters.delete(key(tenantId, accountId));
+  }
   const created = now();
   db.prepare(`INSERT INTO accounts (accountId, tenantId, ownerId, status, loginPhone, createdAt, updatedAt) SELECT ?, tenantId, ownerId, 'connecting', ?, ?, ? FROM tenants WHERE tenantId = ?
-     ON CONFLICT(tenantId, accountId) DO UPDATE SET loginPhone=excluded.loginPhone, phoneCodeHash=NULL, status='connecting', updatedAt=excluded.updatedAt`).run(accountId, phone, created, created, tenantId);
-  console.log(`[loginStart] account record created, calling adapter.sendCode`);
+     ON CONFLICT(tenantId, accountId) DO UPDATE SET loginPhone=excluded.loginPhone, phoneCodeHash=NULL, session=NULL, status='connecting', updatedAt=excluded.updatedAt`).run(accountId, phone, created, created, tenantId);
   const adapter = adapterFor(db, tenantId, accountId);
   try {
     const result = await adapter.sendCode(phone);
-    console.log(`[loginStart] sendCode succeeded`);
     const saved = db.prepare("UPDATE accounts SET phoneCodeHash = ?, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(result.phoneCodeHash, now(), tenantId, accountId);
     if (!saved.changes) throw new Error("login was cancelled");
-    console.log(`[loginStart] success`);
     return { accountId, sent: true };
   } catch (error) {
-    console.log(`[loginStart] sendCode failed:`, error);
     db.prepare("UPDATE accounts SET status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(now(), tenantId, accountId);
     await adapter.logout().catch(() => undefined);
     adapters.delete(key(tenantId, accountId));
@@ -88,30 +93,29 @@ export async function loginStart(db: Database.Database, tenantId: string, phone:
 }
 
 export async function cancelLogin(db: Database.Database, tenantId: string, accountId: string): Promise<void> {
-  db.prepare("UPDATE accounts SET status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(now(), tenantId, accountId);
-  const adapter = adapters.get(key(tenantId, accountId));
+  const changed = db.prepare("UPDATE accounts SET status = 'logged_out', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'").run(now(), tenantId, accountId);
+  if (!changed.changes) return;
+  const adapter = adapters.get(key(tenantId, accountId)) ?? remoteAdapterFor(accountId);
   adapters.delete(key(tenantId, accountId));
   await adapter?.logout().catch(() => undefined);
 }
 
 export async function loginComplete(db: Database.Database, tenantId: string, accountId: string, phone: string, code: string, password?: string): Promise<void> {
-  console.log(`[loginComplete] START - tenantId=${tenantId}, accountId=${accountId}, password=${password?'[set]':'[none]'}`);
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before login");
-  console.log(`[loginComplete] getting adapter`);
   const adapter = adapterFor(db, tenantId, accountId);
-  const row = db.prepare("SELECT phoneCodeHash, status FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { phoneCodeHash: string | null; status: string } | undefined;
-  console.log(`[loginComplete] DB row: status=${row?.status}, hasCodeHash=${!!row?.phoneCodeHash}`);
+  const row = db.prepare("SELECT phoneCodeHash, status, loginPhone FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { phoneCodeHash: string | null; status: string; loginPhone: string | null } | undefined;
   if (row?.status !== "connecting" || !row.phoneCodeHash) throw new Error("login code was not requested");
-  console.log(`[loginComplete] calling adapter.signIn`);
+  if (row.loginPhone !== phone) throw new Error("phone number does not match this login");
   try {
     const result = await adapter.signIn(phone, row.phoneCodeHash, code, password);
-    console.log(`[loginComplete] signIn succeeded, userId=${result.userId}`);
     const saved = db.prepare("UPDATE accounts SET phone = ?, telegramUserId = ?, session = ?, status = 'active', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'")
       .run(phone, result.userId, seal(result.session, config.sessionEncryptionKey), now(), tenantId, accountId);
-    if (!saved.changes) throw new Error("login was cancelled");
-    console.log(`[loginComplete] SUCCESS - account now active`);
+    if (!saved.changes) {
+      await adapter.logout().catch(() => undefined);
+      adapters.delete(key(tenantId, accountId));
+      throw new Error("login was cancelled");
+    }
   } catch (error) {
-    console.log(`[loginComplete] FAILED -`, error);
     throw error;
   }
 }

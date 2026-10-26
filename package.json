@@ -9,14 +9,15 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx src/ads.test.ts && tsx src/rental/contract.test.ts",
+    "test": "tsx src/ads.test.ts && tsx src/scheduler.test.ts && tsx src/rental/contract.test.ts",
     "build": "tsc",
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@grammyjs/runner": "^2.0.3",
     "better-sqlite3": "^12.11.1",
     "dotenv": "^16.4.7",
-    "express": "^5.2.1",
+    "express": "^5.3.0",
     "grammy": "^1.46.0",
     "prebuilt-tdlib": "^0.1008067.0",
     "tdl": "^8.1.0"
@@ -27,6 +28,9 @@
     "@types/node": "^22.20.1",
     "tsx": "^4.23.1",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "body-parser": "^2.4.0"
   },
   "allowScripts": {
     "tdl@8.1.0": true,

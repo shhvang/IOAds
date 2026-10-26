@@ -14,7 +14,7 @@ npm run build
 npm start
 ```
 
-Copy `.env.example` to `.env`. Set `BOT_TOKEN`, `BOT_OWNER_ID`, and `ADS_ARCHIVE_CHAT` for the standalone bot. The bot must be an admin of `ADS_ARCHIVE_CHAT`, and each connected userbot must be a member with permission to view and forward from it. Grant the bot permission to post in `ADS_PROMO_CHAT` and verify membership checks work for `ADS_FORCE_JOIN_CHAT`. `RENTAL_HUB_URL` and `RENTAL_SECRET` are optional. Set `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and
+Copy `.env.example` to `.env`. Set `BOT_TOKEN`, `BOT_OWNER_ID`, and `ADS_ARCHIVE_CHAT` for the standalone bot. The bot must be an admin of `ADS_ARCHIVE_CHAT`; for direct media copying, each connected account must be able to view and forward from it. Verify membership checks work for `ADS_FORCE_JOIN_CHAT`. `RENTAL_HUB_URL` and `RENTAL_SECRET` are optional. Set `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and
 `SESSION_ENCRYPTION_KEY` for real account login and TDLib's encrypted local account database. Configure one or more payment methods with `BINANCE_PAY_ID` plus read-only API credentials, or receiving addresses plus the corresponding explorer API key. The SQLite file is
 `DATA_DIR/ads.db` and should be mounted at `/app/data` in production.
 Plan payments are automatically verified against Binance Pay, BEP20, or TRC20 transaction history. Paid tiers are activated for 30 days after exact amount, destination, transaction status, time window, and uniqueness checks pass.
@@ -25,11 +25,29 @@ IOAds runs independently when `RENTAL_HUB_URL` and `RENTAL_SECRET` are unset.
 Set both only when connecting it to the rental hub; standalone bot users and
 hub-provisioned tenants remain separate.
 
-Free-tier deliveries are copied by the control bot from the archive. Paid
-campaigns with inline mode enabled are sent when the connected userbot selects
-the campaign from the bot's inline results; set `ADS_BOT_USERNAME` to the bot's
-username and enable inline mode for that bot in BotFather. Other paid deliveries
-copy through the connected userbot, which needs access to the archive chat.
+Text campaigns send directly from the connected user account, including
+formatting and custom emoji entities. Telegram requires a Premium connected
+account to send Premium custom emoji. Media campaigns can use the bot's inline
+results when `ADS_BOT_USERNAME` and inline mode are configured. Media with
+custom emoji captions always copies through the Premium connected account,
+which must have access to the archive chat. Other media can also use direct
+copying. The control bot has no campaign delivery path to target groups or a
+separate promotion chat; it only archives incoming media. Keep the archive
+separate from every campaign target.
+
+Campaigns stay as drafts until at least one group is selected and Schedule is
+pressed. The bot shows this action after group selection. Group lists are read
+from the local cache during setup; Refresh groups performs a full Telegram
+sync only when requested. Activity shows delivery failures and retry times.
+
+The scheduler runs in a separate supervised process and stores work in SQLite.
+`ADS_DELIVERY_CONCURRENCY` sets the number of deliveries it can issue in one
+pass; `ADS_WORKER_COUNT` sets the number of supervised sender processes. Each
+account always maps to the same sender process. A sender crash restarts that
+process and queued deliveries are retried. `ADS_WORKER_IDLE_MS` closes idle
+TDLib clients to reduce memory use. The control bot uses concurrent polling;
+using a webhook for that one bot would not change user account delivery, which
+uses TDLib connections rather than Bot API polling.
 
 ## Authentication boundary
 
@@ -59,9 +77,9 @@ Existing GramJS sessions must be connected again; new TDLib sessions persist.
 Groups are limited to dialogs already visible to the connected user account.
 The service does not join groups, scrape members, discover chats, or send DMs.
 
-Tier ranks are explicit: `starter` is rank 1, `pro` rank 2, and `business` rank
-3. Group message overrides are persisted, but create/update rejects them below
-rank 2 and the scheduler ignores them below rank 2.
+Tier ranks are explicit: `free` and `starter` are rank 0, `pro` is rank 1,
+and `business` is rank 2. Group message overrides are persisted, but
+create/update rejects them below rank 1 and the scheduler ignores them there.
 
 Delivery claims use a stable occurrence key and are at-least-once: a process
 crash after Telegram accepts a message but before SQLite marks it sent can

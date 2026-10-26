@@ -1,5 +1,6 @@
 import { Bot, InlineKeyboard, type Context } from "grammy";
-import type { InlineKeyboardButton } from "grammy/types";
+import { run, sequentialize } from "@grammyjs/runner";
+import type { InlineKeyboardButton, InlineQueryResult } from "grammy/types";
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
@@ -11,6 +12,36 @@ import { tierLimits } from "./services/plans.js";
 import { paymentMethods, verifyPayment, type PaymentMethod } from "./payments.js";
 
 type Flow = { action: "phone" | "sending_code" | "code" | "password" | "verifying_code" | "campaign" | "payment"; accountId?: string; phone?: string; code?: string; tier?: string; method?: PaymentMethod; paymentId?: number };
+type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
+type CachedInlineMedia = WithoutId<Extract<InlineQueryResult, { type: "photo" | "video" | "document" | "gif" | "mpeg4_gif" | "audio" | "voice" | "sticker" }>>;
+
+class PersistentFlows extends Map<number, Flow> {
+  constructor(private readonly db: Database.Database) {
+    super();
+    const cutoff = new Date(Date.now() - 30 * 60_000).toISOString();
+    db.prepare("DELETE FROM botFlows WHERE updatedAt < ?").run(cutoff);
+    for (const row of db.prepare("SELECT telegramId,data FROM botFlows").all() as Array<{ telegramId: number; data: string }>) {
+      try { super.set(row.telegramId, JSON.parse(row.data) as Flow); } catch { db.prepare("DELETE FROM botFlows WHERE telegramId=?").run(row.telegramId); }
+    }
+  }
+  override set(userId: number, flow: Flow): this {
+    super.set(userId, flow);
+    const action = flow.action === "sending_code" ? "phone" : flow.action === "verifying_code" ? "code" : flow.action;
+    const saved = { ...flow, action, code: undefined };
+    this.db.prepare("INSERT INTO botFlows (telegramId,data,updatedAt) VALUES (?,?,?) ON CONFLICT(telegramId) DO UPDATE SET data=excluded.data,updatedAt=excluded.updatedAt")
+      .run(userId, JSON.stringify(saved), now());
+    return this;
+  }
+  override delete(userId: number): boolean {
+    this.db.prepare("DELETE FROM botFlows WHERE telegramId=?").run(userId);
+    return super.delete(userId);
+  }
+  sweep(): void {
+    const cutoff = new Date(Date.now() - 30 * 60_000).toISOString();
+    const stale = this.db.prepare("SELECT telegramId FROM botFlows WHERE updatedAt < ?").all(cutoff) as Array<{ telegramId: number }>;
+    for (const row of stale) this.delete(row.telegramId);
+  }
+}
 
 const button = (text: string, callback_data: string): InlineKeyboardButton => ({
   text, callback_data,
@@ -22,6 +53,21 @@ function menu(rows: InlineKeyboardButton[][]): InlineKeyboard {
 
 function escapeHtml(value: unknown): string {
   return String(value).replace(/[&<>]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[char]!);
+}
+
+function cachedInlineMedia(msg: NonNullable<Context["message"]>): CachedInlineMedia | null {
+  const caption = msg.caption;
+  const caption_entities = msg.caption_entities;
+  if (msg.photo?.length) return { type: "photo", photo_file_id: msg.photo.at(-1)!.file_id, caption, caption_entities };
+  if (msg.video) return { type: "video", video_file_id: msg.video.file_id, title: msg.caption?.slice(0, 80) || "Campaign video", caption, caption_entities };
+  if (msg.document) return { type: "document", document_file_id: msg.document.file_id, title: msg.document.file_name || "Campaign document", caption, caption_entities };
+  if (msg.animation) return msg.animation.mime_type === "image/gif"
+    ? { type: "gif", gif_file_id: msg.animation.file_id, caption, caption_entities }
+    : { type: "mpeg4_gif", mpeg4_file_id: msg.animation.file_id, caption, caption_entities };
+  if (msg.audio) return { type: "audio", audio_file_id: msg.audio.file_id, caption, caption_entities };
+  if (msg.voice) return { type: "voice", voice_file_id: msg.voice.file_id, title: "Campaign voice message", caption, caption_entities };
+  if (msg.sticker) return { type: "sticker", sticker_file_id: msg.sticker.file_id };
+  return null;
 }
 
 function loginError(error: unknown): string {
@@ -41,6 +87,7 @@ function loginError(error: unknown): string {
 export function startAdsBot(db: Database.Database): void {
   if (!config.botToken) return;
   const bot = new Bot(config.botToken, { client: { apiRoot: config.telegramApiRoot } });
+  bot.use(sequentialize((ctx) => ctx.from ? String(ctx.from.id) : undefined));
   
   void bot.api.setMyCommands([
     { command: "start", description: "Start the bot" },
@@ -48,14 +95,16 @@ export function startAdsBot(db: Database.Database): void {
     { command: "help", description: "Get help" },
   ]);
   
-  const flows = new Map<number, Flow>();
+  const flows = new PersistentFlows(db);
+  setInterval(() => flows.sweep(), 60_000).unref();
+  const membership = new Map<number, { allowed: boolean; expires: number }>();
   const tenantId = (userId: number): string => {
     const row = db.prepare("SELECT tenantId FROM localUsers WHERE telegramId = ?").get(userId) as { tenantId: string } | undefined;
     if (!row) throw new Error("Send /start to set up your ads account.");
     return row.tenantId;
   };
   const home = () => menu([
-    [button("Start", "newcampaign")],
+    [button("New campaign", "newcampaign")],
     [button("Campaigns", "campaigns"), button("Accounts", "accounts")],
     [button("Groups", "groups"), button("Schedule", "schedule")],
     [button("Activity", "activity"), button("Plan", "plan")],
@@ -75,6 +124,7 @@ export function startAdsBot(db: Database.Database): void {
     else await ctx.reply(caption, { parse_mode: "HTML", reply_markup: home() });
   };
   bot.use(async (ctx, next) => {
+    if (ctx.chatMember) { await next(); return; }
     const flow = ctx.from ? flows.get(ctx.from.id) : undefined;
     if (ctx.callbackQuery && flow && ["phone", "sending_code", "code", "password", "verifying_code"].includes(flow.action)
       && ctx.callbackQuery.data !== "login:cancel") {
@@ -82,13 +132,17 @@ export function startAdsBot(db: Database.Database): void {
       return;
     }
     if (ctx.from && !ctx.message?.text?.startsWith("/start")) {
+      const cached = membership.get(ctx.from.id);
+      if (cached && cached.expires > Date.now() && cached.allowed) { await next(); return; }
       try {
         const member = await ctx.api.getChatMember(config.forceJoinChat, ctx.from.id);
          if (member.status === "left" || member.status === "kicked" || (member.status === "restricted" && !member.is_member)) {
+          membership.set(ctx.from.id, { allowed: false, expires: Date.now() + 30_000 });
           db.prepare("UPDATE localUsers SET forceJoined = 0, updatedAt = ? WHERE telegramId = ?").run(now(), ctx.from.id);
           await ctx.reply("Join @iobuysell to use your userbots.", { reply_markup: menu([[{ text: "Join", url: "https://t.me/iobuysell" }], [button("Check", "home")]]) });
           return;
         }
+        membership.set(ctx.from.id, { allowed: true, expires: Date.now() + 60_000 });
         db.prepare("UPDATE localUsers SET forceJoined = 1, updatedAt = ? WHERE telegramId = ?").run(now(), ctx.from.id);
       } catch {
          await ctx.reply("I can’t verify your @iobuysell membership yet. Open the group, then try again.", { reply_markup: menu([[{ text: "Open", url: "https://t.me/iobuysell" }]]) });
@@ -97,8 +151,18 @@ export function startAdsBot(db: Database.Database): void {
     }
     await next();
   });
+  bot.on("chat_member", async (ctx) => {
+    const chat = ctx.chat;
+    if (String(chat.id) !== config.forceJoinChat && `@${chat.username ?? ""}`.toLowerCase() !== config.forceJoinChat.toLowerCase()) return;
+    const member = ctx.chatMember.new_chat_member;
+    const allowed = member.status !== "left" && member.status !== "kicked" && (member.status !== "restricted" || member.is_member);
+    const userId = member.user.id;
+    membership.set(userId, { allowed, expires: Date.now() + 60_000 });
+    db.prepare("UPDATE localUsers SET forceJoined=?,updatedAt=? WHERE telegramId=?").run(allowed ? 1 : 0, now(), userId);
+  });
   bot.command("start", async (ctx) => {
     const userId = ctx.from!.id;
+    flows.delete(userId);
     const tid = `ads:${userId}`;
     db.prepare("INSERT OR IGNORE INTO localUsers (telegramId, tenantId, tierCode, createdAt, updatedAt) VALUES (?, ?, 'free', ?, ?)").run(userId, tid, now(), now());
     db.prepare(`INSERT OR IGNORE INTO tenants (tenantId, productId, ownerId, state, tierCode, runtime, version, trial, suspendReason, periodEnd, retainUntil, limits, config, secretsFingerprint, controlBotFingerprint, controlBotToken, fault, updatedAt, appliedAt) VALUES (?, 'ads-standalone', ?, 'active', 'free', 'service', 1, 0, NULL, NULL, NULL, ?, '{}', NULL, NULL, NULL, NULL, ?, ?)`)
@@ -106,7 +170,7 @@ export function startAdsBot(db: Database.Database): void {
     try {
       const member = await ctx.api.getChatMember(config.forceJoinChat, userId);
        if (member.status === "left" || member.status === "kicked" || (member.status === "restricted" && !member.is_member)) {
-          await ctx.reply("Join @iobuysell to activate campaigns. Your free ads are also posted there every 10 minutes.", { reply_markup: menu([[{ text: "Join", url: "https://t.me/iobuysell" }], [button("Check", "home")]]) });
+          await ctx.reply("Join @iobuysell to activate campaigns.", { reply_markup: menu([[{ text: "Join", url: "https://t.me/iobuysell" }], [button("Check", "home")]]) });
         return;
       }
       db.prepare("UPDATE localUsers SET forceJoined = 1, updatedAt = ? WHERE telegramId = ?").run(now(), userId);
@@ -118,12 +182,12 @@ export function startAdsBot(db: Database.Database): void {
   });
   bot.command("menu", showHome);
   bot.command("help", (ctx) => ctx.reply("Welcome to IOAds. Connect a Telegram account, choose groups it already belongs to, then forward an ad to create a campaign. Set its schedule and delivery method, and review activity any time from the dashboard."));
-  bot.callbackQuery("help", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>Getting started</b>\nConnect an account, sync its existing groups, then forward the message you want to promote. Choose targets, set an interval from 5 minutes to 1 hour, and schedule it.\n\nAccounts remain yours: IOAds only uses groups visible to the account and never joins groups or messages members.", { parse_mode: "HTML", reply_markup: menu([[button("Start", "newcampaign")], [button("Accounts", "accounts"), button("Groups", "groups")], [button("Home", "home")]]) }); });
-  bot.callbackQuery("schedule", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>Schedule</b>\nReview campaign status, delivery interval, target groups, and posting method. Open any campaign to pause it or change its timing.", { parse_mode: "HTML", reply_markup: menu([[button("Campaigns", "campaigns")], [button("Start", "newcampaign")], [button("Home", "home")]]) }); });
+  bot.callbackQuery("help", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>Getting started</b>\nConnect an account, sync its existing groups, then forward the message you want to promote. Choose targets, set an interval from 5 minutes to 1 hour, and schedule it.\n\nAccounts remain yours: IOAds only uses groups visible to the account and never joins groups or messages members.", { parse_mode: "HTML", reply_markup: menu([[button("New campaign", "newcampaign")], [button("Accounts", "accounts"), button("Groups", "groups")], [button("Home", "home")]]) }); });
+  bot.callbackQuery("schedule", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>Schedule</b>\nReview campaign status, delivery interval, target groups, and posting method. Open any campaign to pause it or change its timing.", { parse_mode: "HTML", reply_markup: menu([[button("Campaigns", "campaigns")], [button("New campaign", "newcampaign")], [button("Home", "home")]]) }); });
   bot.callbackQuery("activity", async (ctx) => {
     await ctx.answerCallbackQuery();
-    const rows = db.prepare("SELECT c.name, d.chatId, d.status, d.sentAt FROM deliveries d JOIN campaigns c ON c.id = d.campaignId WHERE d.tenantId = ? ORDER BY d.id DESC LIMIT 8").all(tenantId(ctx.from.id)) as Array<{ name: string; chatId: string; status: string; sentAt: string | null }>;
-    const body = rows.length ? rows.map((row) => `• <b>${escapeHtml(row.name)}</b> · ${row.status} · ${escapeHtml(row.chatId)}`).join("\n") : "No deliveries yet. Completed sends will appear here.";
+    const rows = db.prepare("SELECT c.name, d.chatId, d.status, d.error, d.nextAttemptAt FROM deliveries d JOIN campaigns c ON c.id = d.campaignId WHERE d.tenantId = ? ORDER BY d.id DESC LIMIT 8").all(tenantId(ctx.from.id)) as Array<{ name: string; chatId: string; status: string; error: string | null; nextAttemptAt: string | null }>;
+    const body = rows.length ? rows.map((row) => `• <b>${escapeHtml(row.name)}</b> · ${row.status} · ${escapeHtml(row.chatId)}${row.error ? `\n  ${escapeHtml(row.error.slice(0, 120))}` : ""}${row.status === "retry" && row.nextAttemptAt ? `\n  retry ${escapeHtml(row.nextAttemptAt)}` : ""}`).join("\n") : "No deliveries yet. Scheduled sends will appear here.";
     await ctx.editMessageText(`🗃 <b>Activity</b>\nRecent campaign deliveries\n\n${body}`, { parse_mode: "HTML", reply_markup: menu([[button("Campaigns", "campaigns")], [button("Home", "home")]]) });
   });
   bot.callbackQuery("settings", async (ctx) => { await ctx.answerCallbackQuery(); await ctx.editMessageText("<b>Settings</b>\nManage linked Telegram accounts, group access, plan limits, and campaign delivery preferences.", { parse_mode: "HTML", reply_markup: menu([[button("Accounts", "accounts"), button("Groups", "groups")], [button("Plan", "plan"), button("Home", "home")]]) }); });
@@ -169,7 +233,7 @@ export function startAdsBot(db: Database.Database): void {
   bot.callbackQuery("campaigns", async (ctx) => {
     await ctx.answerCallbackQuery();
     const tid = tenantId(ctx.from.id), list = listCampaigns(db, tid) as Array<{ id: number; name: string; status: string; intervalSeconds: number }>;
-    const keyboard = menu([[button("Start", "newcampaign")], ...list.slice(0, 8).map((c, index) => [button(String(index + 1), `campaign:${c.id}`)]), [button("Back", "home")]]);
+    const keyboard = menu([[button("New campaign", "newcampaign")], ...list.slice(0, 8).map((c, index) => [button(`${index + 1}. ${c.status === "draft" ? "Review draft" : "Open"}`, `campaign:${c.id}`)]), [button("Back", "home")]]);
     const body = list.slice(0, 8).map((c, index) => `${index + 1}. <b>${escapeHtml(c.name)}</b> · ${c.status} · every ${c.intervalSeconds / 60}m`).join("\n");
     await ctx.editMessageText(`📢 <b>Campaigns</b>\n${list.length ? `${list.length} campaign${list.length === 1 ? "" : "s"}. Select a number to review its schedule and delivery settings.\n\n${body}` : "No campaigns yet. Create one by forwarding your ad, then choose where and how often it should post."}`, { parse_mode: "HTML", reply_markup: keyboard });
   });
@@ -184,12 +248,25 @@ export function startAdsBot(db: Database.Database): void {
       : user
         ? db.prepare("SELECT id, name, message, messageEntities, richMessage FROM campaigns WHERE tenantId = ? AND status IN ('draft','scheduled','paused') ORDER BY id DESC LIMIT 20").all(user.tenantId)
         : []) as Array<{ id: number; name: string; message: string; messageEntities: string; richMessage: string | null }>;
-    await ctx.answerInlineQuery(campaigns.map((campaign) => ({ type: "article" as const, id: String(campaign.id), title: campaign.name, description: campaign.message.slice(0, 100), input_message_content: campaign.richMessage ? { rich_message: JSON.parse(campaign.richMessage) } : { message_text: campaign.message, entities: JSON.parse(campaign.messageEntities) } })), { cache_time: 0, is_personal: true });
+    const results: InlineQueryResult[] = campaigns.map((campaign) => {
+      const media = campaign.richMessage ? JSON.parse(campaign.richMessage) as CachedInlineMedia : null;
+      return media && ["photo", "video", "document", "gif", "mpeg4_gif", "audio", "voice", "sticker"].includes(media.type)
+        ? { ...media, id: String(campaign.id) } as InlineQueryResult
+        : { type: "article", id: String(campaign.id), title: campaign.name, description: campaign.message.slice(0, 100), input_message_content: { message_text: campaign.message, entities: JSON.parse(campaign.messageEntities) } };
+    });
+    await ctx.answerInlineQuery(results, { cache_time: 0, is_personal: true });
   });
   bot.callbackQuery("newcampaign", async (ctx) => {
-    const list = accounts(db, tenantId(ctx.from.id)).filter((a) => a.status === "active");
+    const tid = tenantId(ctx.from.id);
+    const list = accounts(db, tid).filter((a) => a.status === "active");
     await ctx.answerCallbackQuery();
     if (!list.length) return ctx.reply("Connect an account before creating a campaign.", { reply_markup: menu([[button("Add", "connect")], [button("Back", "home")]]) });
+    const existing = db.prepare("SELECT id,status FROM campaigns WHERE tenantId=? AND status!='cancelled' ORDER BY id DESC").all(tid) as Array<{ id: number; status: string }>;
+    const tier = (db.prepare("SELECT tierCode FROM localUsers WHERE telegramId=?").get(ctx.from.id) as { tierCode: string }).tierCode;
+    if (existing.length >= tierLimits(tier).campaigns) {
+      const draft = existing.find((item) => item.status === "draft");
+      return ctx.reply(draft ? "You already have a draft. Select its groups and schedule it here." : "Your plan’s campaign limit is full. Open a campaign to manage it.", { reply_markup: menu([[button(draft ? "Open draft" : "Campaigns", draft ? `campaign:${draft.id}` : "campaigns")], [button("Back", "home")]]) });
+    }
     flows.set(ctx.from.id, { action: "campaign", accountId: list[0]!.accountId });
     await ctx.reply("<b>New campaign</b>\nForward the original ad message here. Text, formatting, photos, videos, and supported rich content are preserved. You can choose the groups and schedule next.", { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "home")]]) });
   });
@@ -198,12 +275,43 @@ export function startAdsBot(db: Database.Database): void {
     const id = Number(ctx.match[1]), campaign = db.prepare("SELECT name, status, intervalSeconds FROM campaigns WHERE tenantId = ? AND id = ?").get(tenantId(ctx.from.id), id) as { name: string; status: string; intervalSeconds: number } | undefined;
     if (!campaign) return ctx.reply("Campaign not found.");
     const action = campaign.status === "scheduled" ? "pause" : "schedule";
-    const inline = db.prepare("SELECT inlineMode FROM campaigns WHERE tenantId = ? AND id = ?").get(tenantId(ctx.from.id), id) as { inlineMode: number };
-    const rows: InlineKeyboardButton[][] = [[button(action === "pause" ? "Pause" : "Schedule", `setcampaign:${id}:${action}`), button("Cancel", `setcampaign:${id}:cancel`)], [button("5m", `interval:${id}:300`), button("30m", `interval:${id}:1800`), button("60m", `interval:${id}:3600`)]];
-    if (!['free', 'starter'].includes((db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { tierCode: string }).tierCode)) rows.push([button(inline.inlineMode ? "Direct" : "Inline", `inline:${id}`)]);
+    const tid = tenantId(ctx.from.id);
+    const inline = db.prepare("SELECT inlineMode,contentKind,messageEntities FROM campaigns WHERE tenantId = ? AND id = ?").get(tid, id) as { inlineMode: number; contentKind: string; messageEntities: string };
+    const hasCustomEmoji = (JSON.parse(inline.messageEntities || "[]") as Array<{ type: string }>).some((entity) => entity.type === "custom_emoji");
+    const targets = (db.prepare(`SELECT COUNT(*) AS count FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId WHERE ct.tenantId=? AND ct.campaignId=? AND ct.enabled=1 AND g.enabled=1`).get(tid, id) as { count: number }).count;
+    const rows: InlineKeyboardButton[][] = [[button(action === "pause" ? "Pause" : "Schedule", `setcampaign:${id}:${action}`), button("Cancel", `setcampaign:${id}:cancel`)], [button("Choose groups", `campaigntargets:${id}`)], [button("5m", `interval:${id}:300`), button("30m", `interval:${id}:1800`), button("60m", `interval:${id}:3600`)]];
+    if (config.botUsername && inline.contentKind !== "text" && !hasCustomEmoji && !['free', 'starter'].includes((db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { tierCode: string }).tierCode)) rows.push([button(inline.inlineMode ? "Direct" : "Inline", `inline:${id}`)]);
     rows.push([button("Back", "campaigns")]);
     const keyboard = menu(rows);
-    await ctx.editMessageText(`<b>${campaign.name}</b>\nStatus: ${campaign.status}\nInterval: ${campaign.intervalSeconds / 60} minutes\nPosting: ${inline.inlineMode ? "bot inline via userbot" : "direct userbot"}`, { parse_mode: "HTML", reply_markup: keyboard });
+    await ctx.editMessageText(`<b>${escapeHtml(campaign.name)}</b>\nStatus: ${campaign.status}\nGroups selected: ${targets}\nInterval: ${campaign.intervalSeconds / 60} minutes\nPosting: ${inline.contentKind === "text" ? "connected account" : inline.inlineMode && !hasCustomEmoji ? "inline via connected account" : "connected account copy"}${!targets ? "\n\nSelect a group before scheduling." : ""}`, { parse_mode: "HTML", reply_markup: keyboard });
+  });
+  const showCampaignTargets = async (ctx: Context, id: number) => {
+    const tid = tenantId(ctx.from!.id);
+    const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tid, id) as { senderAccountId: string } | undefined;
+    if (!campaign) throw new Error("Campaign not found.");
+    const groups = db.prepare(`SELECT g.chatId,g.title,ct.enabled AS selected FROM groups g LEFT JOIN campaignTargets ct
+      ON ct.tenantId=g.tenantId AND ct.accountId=g.accountId AND ct.chatId=g.chatId AND ct.campaignId=?
+      WHERE g.tenantId=? AND g.accountId=? ORDER BY g.title LIMIT 25`)
+      .all(id, tid, campaign.senderAccountId) as Array<{ chatId: string; title: string; selected: number | null }>;
+    const rows = groups.map((group, index) => [button(`${group.selected ? "✓ " : ""}${index + 1}`, `target:${id}:${group.chatId}`)]);
+    rows.push([button("Refresh groups", `campaignrefresh:${id}`)]);
+    rows.push([button("Review & schedule", `campaign:${id}`)]);
+    const names = groups.map((group, index) => `${index + 1}. ${group.selected ? "✓ " : ""}${escapeHtml(group.title)}`).join("\n");
+    await ctx.editMessageText(`📢 <b>Choose target groups</b>\nSelect one or more groups, then review and schedule the campaign.\n\n${names || "No groups cached yet. Tap Refresh groups to load chats visible to this account."}`, { parse_mode: "HTML", reply_markup: menu(rows) });
+  };
+  bot.callbackQuery(/^campaigntargets:(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    try { await showCampaignTargets(ctx, Number(ctx.match[1])); }
+    catch (error) { await ctx.reply(String(error instanceof Error ? error.message : error)); }
+  });
+  bot.callbackQuery(/^campaignrefresh:(\d+)$/, async (ctx) => {
+    await ctx.answerCallbackQuery("Refreshing groups");
+    const tid = tenantId(ctx.from.id), id = Number(ctx.match[1]);
+    const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId=? AND id=?").get(tid, id) as { senderAccountId: string } | undefined;
+    if (!campaign) return ctx.reply("Campaign not found.");
+    await ctx.editMessageText("Refreshing groups from your connected account…");
+    try { await syncGroups(db, tid, campaign.senderAccountId); await showCampaignTargets(ctx, id); }
+    catch (error) { await ctx.reply(`Could not refresh groups: ${String(error instanceof Error ? error.message : error)}`, { reply_markup: menu([[button("Back to campaign", `campaign:${id}`)]]) }); }
   });
   bot.callbackQuery(/^interval:(\d+):(300|1800|3600)$/, async (ctx) => {
     const [, id, seconds] = ctx.match;
@@ -213,15 +321,26 @@ export function startAdsBot(db: Database.Database): void {
     if (campaign) await ctx.editMessageText(`<b>${escapeHtml(campaign.name)}</b>\nStatus: ${campaign.status}\nInterval: ${Number(seconds) / 60} minutes`, { parse_mode: "HTML", reply_markup: menu([[button("Schedule", `setcampaign:${id}:schedule`), button("Cancel", `setcampaign:${id}:cancel`)], [button("5m", `interval:${id}:300`), button("30m", `interval:${id}:1800`), button("60m", `interval:${id}:3600`)], [button("Back", `campaign:${id}`)]]) });
   });
   bot.callbackQuery(/^inline:(\d+)$/, async (ctx) => {
+    if (!config.botUsername) return ctx.answerCallbackQuery({ text: "Inline delivery is not configured.", show_alert: true });
+    const campaign = db.prepare("SELECT contentKind,messageEntities FROM campaigns WHERE tenantId=? AND id=?").get(tenantId(ctx.from.id), Number(ctx.match[1])) as { contentKind: string; messageEntities: string } | undefined;
+    if (!campaign || campaign.contentKind === "text") return ctx.answerCallbackQuery({ text: "Text campaigns use the connected account directly.", show_alert: true });
+    if ((JSON.parse(campaign.messageEntities || "[]") as Array<{ type: string }>).some((entity) => entity.type === "custom_emoji"))
+      return ctx.answerCallbackQuery({ text: "Custom emoji captions need a direct copy from a Premium connected account.", show_alert: true });
+    const tier = (db.prepare("SELECT tierCode FROM localUsers WHERE telegramId=?").get(ctx.from.id) as { tierCode: string }).tierCode;
+    if (tier === "free" || tier === "starter") return ctx.answerCallbackQuery({ text: "This setting is available on paid plans.", show_alert: true });
     const id = Number(ctx.match[1]);
     db.prepare("UPDATE campaigns SET inlineMode = 1 - inlineMode, updatedAt = ? WHERE tenantId = ? AND id = ?").run(now(), tenantId(ctx.from.id), id);
     await ctx.answerCallbackQuery("Posting method updated");
   });
   bot.callbackQuery(/^setcampaign:(\d+):(pause|schedule|cancel)$/, async (ctx) => {
     const [, rawId, status] = ctx.match;
-    setCampaignStatus(db, tenantId(ctx.from.id), Number(rawId), status === "pause" ? "paused" : status === "cancel" ? "cancelled" : "scheduled");
-    await ctx.answerCallbackQuery("Campaign updated");
-    await ctx.editMessageText(`Campaign ${status === "cancel" ? "cancelled" : status}.`, { reply_markup: menu([[button("Campaigns", "campaigns")], [button("Dashboard", "home")]]) });
+    try {
+      setCampaignStatus(db, tenantId(ctx.from.id), Number(rawId), status === "pause" ? "paused" : status === "cancel" ? "cancelled" : "scheduled");
+      await ctx.answerCallbackQuery("Campaign updated");
+      await ctx.editMessageText(`Campaign ${status === "cancel" ? "cancelled" : status === "pause" ? "paused" : "scheduled. Its first delivery is queued now."}`, { reply_markup: menu([[button("Campaigns", "campaigns")], [button("Dashboard", "home")]]) });
+    } catch (error) {
+      await ctx.answerCallbackQuery({ text: String(error instanceof Error ? error.message : error), show_alert: true });
+    }
   });
   bot.callbackQuery("groups", async (ctx) => {
     const tid = tenantId(ctx.from.id), list = accounts(db, tid).filter((a) => a.status === "active");
@@ -278,10 +397,12 @@ export function startAdsBot(db: Database.Database): void {
       const tid = tenantId(ctx.from.id);
       const campaign = db.prepare("SELECT senderAccountId FROM campaigns WHERE tenantId = ? AND id = ?").get(tid, Number(campaignId)) as { senderAccountId: string } | undefined;
       if (!campaign) throw new Error("campaign not found");
-      await addTarget(db, tid, Number(campaignId), chatId!);
       const tier = (db.prepare("SELECT tierCode FROM tenants WHERE tenantId = ?").get(tid) as { tierCode: string }).tierCode;
       await setGroup(db, tid, campaign.senderAccountId, chatId!, true, undefined, tier === "business" ? 2 : tier === "pro" ? 1 : 0);
+      await addTarget(db, tid, Number(campaignId), chatId!);
       await ctx.answerCallbackQuery("Target added");
+      const selected = db.prepare("SELECT COUNT(*) AS count FROM campaignTargets WHERE tenantId=? AND campaignId=? AND enabled=1").get(tid, Number(campaignId)) as { count: number };
+      await ctx.editMessageText(`📢 <b>Campaign ready to schedule</b>\n${selected.count} group${selected.count === 1 ? "" : "s"} selected. Tap Schedule now to start delivery, or choose more groups.`, { parse_mode: "HTML", reply_markup: menu([[button("Schedule now", `setcampaign:${campaignId}:schedule`)], [button("Choose more groups", `campaigntargets:${campaignId}`)], [button("Review campaign", `campaign:${campaignId}`)]]) });
     } catch (error) {
       await ctx.answerCallbackQuery({ text: String(error instanceof Error ? error.message : error), show_alert: true });
     }
@@ -303,12 +424,7 @@ export function startAdsBot(db: Database.Database): void {
         }
         const sendingFlow: Flow = { action: "sending_code", accountId: randomUUID(), phone };
         flows.set(ctx.from.id, sendingFlow);
-        let frame = 0;
         const progress = await ctx.reply("Connecting to Telegram");
-        const progressTimer = setInterval(() => {
-          frame = (frame + 1) % 4;
-          void ctx.api.editMessageText(ctx.chat.id, progress.message_id, `Connecting to Telegram${".".repeat(frame)}`).catch(() => undefined);
-        }, 1_500);
         const action = setInterval(() => void ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => undefined), 4_000);
         try {
           await ctx.api.sendChatAction(ctx.chat.id, "typing");
@@ -318,10 +434,8 @@ export function startAdsBot(db: Database.Database): void {
             return;
           }
           flows.set(ctx.from.id, { action: "code", accountId: result.accountId, phone });
-          clearInterval(progressTimer);
            await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `✅ <b>Code sent</b>\n\nTelegram sent a login code to <code>${escapeHtml(phone)}</code>. Check the account's Telegram app or SMS.\n\n⚠️ <b>If this is your current account:</b> Send the code with spaces between digits (e.g., <code>1 2 3 4 5</code>) to prevent auto-fill.\n\n<b>Otherwise:</b> Send the code normally (e.g., <code>12345</code>).`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
         } finally {
-          clearInterval(progressTimer);
           clearInterval(action);
         }
       } else if (flow.action === "code" || flow.action === "password") {
@@ -329,46 +443,33 @@ export function startAdsBot(db: Database.Database): void {
         const inputCode = rawInput.replace(/\s+/g, "");
         const code = flow.action === "password" ? flow.code : inputCode;
         const passwordValue = flow.action === "password" ? rawInput : undefined;
-        console.log(`[bot] User ${ctx.from.id} submitted login input: flow.action=${flow.action}, accountId=${flow.accountId}`);
         if (flow.action === "code" && !/^\d{5,6}$/.test(inputCode)) {
-          console.log(`[bot] Invalid code format, rejecting`);
           await ctx.reply("Send the 5 or 6 digit login code from Telegram.\n\n💡 Tip: You can send it with or without spaces (e.g., <code>12345</code> or <code>1 2 3 4 5</code>).", { parse_mode: "HTML" });
           return;
         }
         const verifyingFlow: Flow = { ...flow, action: "verifying_code" };
         flows.set(ctx.from.id, verifyingFlow);
-        console.log(`[bot] Starting verification, setting flow to verifying_code`);
-        let frame = 0;
         const progress = await ctx.reply("Verifying your login with Telegram");
-        const progressTimer = setInterval(() => {
-          frame = (frame + 1) % 4;
-          void ctx.api.editMessageText(ctx.chat.id, progress.message_id, `Verifying your login with Telegram${".".repeat(frame)}`).catch(() => undefined);
-        }, 1_500);
         const action = setInterval(() => void ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => undefined), 4_000);
         try {
-          console.log(`[bot] Calling loginComplete with accountId=${flow.accountId}, password=${passwordValue?'[set]':'[none]'}`);
           await ctx.api.sendChatAction(ctx.chat.id, "typing");
-          await loginComplete(db, tenantId(ctx.from.id), flow.accountId!, flow.phone!, code!, passwordValue);
-          clearInterval(progressTimer);
+          await loginComplete(db, tenantId(ctx.from.id), flow.accountId!, flow.phone!, code ?? "", passwordValue);
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           flows.delete(ctx.from.id);
-          console.log(`[bot] Login successful for user ${ctx.from.id}`);
           await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "<b>Userbot connected</b>\nYou can now sync its groups and create a campaign.", { parse_mode: "HTML", reply_markup: home() });
         } catch (error) {
-          console.log(`[bot] Login failed for user ${ctx.from.id}:`, error);
-          clearInterval(progressTimer);
           if (flows.get(ctx.from.id) !== verifyingFlow) return;
           if (String(error).toUpperCase().includes("SESSION_PASSWORD_NEEDED") && flow.action === "code") {
-            console.log(`[bot] 2FA required, prompting for password`);
             flows.set(ctx.from.id, { ...flow, action: "password", code: code! });
              await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "🔐 <b>Two-step verification required</b>\n\nThis account has 2FA enabled. Send your cloud password (the one you set in Security settings, not the login code) to complete the connection.", { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
+          } else if (flow.action === "password" && !flow.code && /PHONE_CODE_INVALID|not waiting for a login code/i.test(String(error))) {
+            flows.set(ctx.from.id, { ...flow, action: "code" });
+            await ctx.api.editMessageText(ctx.chat.id, progress.message_id, "The login session resumed after a restart. Send the Telegram code again, or cancel to request a new one.", { reply_markup: menu([[button("Cancel", "login:cancel")]]) });
           } else {
-            console.log(`[bot] Showing error to user: ${loginError(error)}`);
             flows.set(ctx.from.id, { ...flow, action: flow.action === "password" ? "password" : "code", code: flow.action === "password" ? flow.code : code });
              await ctx.api.editMessageText(ctx.chat.id, progress.message_id, `❌ <b>Login failed</b>\n\n${loginError(error)}\n\nTry again or cancel to start over.`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "login:cancel")]]) });
           }
         } finally {
-          clearInterval(progressTimer);
           clearInterval(action);
         }
       } else if (flow.action === "payment") {
@@ -406,20 +507,44 @@ export function startAdsBot(db: Database.Database): void {
   bot.on("message", async (ctx) => {
     const flow = flows.get(ctx.from.id);
     if (flow?.action !== "campaign") return;
-    const msg = ctx.message;
-    const message = msg.text ?? msg.caption ?? "[Telegram media or rich message]";
-    const tid = tenantId(ctx.from.id), plan = (db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { tierCode: string }).tierCode;
-    const archived = await ctx.api.copyMessage(config.archiveChat || ctx.from.id, msg.chat.id, msg.message_id);
-    const created = createCampaign(db, tid, { name: message.slice(0, 50), message, senderAccountId: flow.accountId!, intervalSeconds: 300 }) as { id: number };
-    db.prepare("UPDATE campaigns SET messageEntities = ?, sourceChatId = ?, sourceMessageId = ?, richMessage = ?, inlineMode = ? WHERE id = ? AND tenantId = ?")
-      .run(JSON.stringify(msg.entities ?? msg.caption_entities ?? []), config.archiveChat || String(ctx.from.id), archived.message_id, msg.rich_message ? JSON.stringify(msg.rich_message) : null, plan === "free" || plan === "starter" ? 1 : 0, created.id, tid);
-    flows.delete(ctx.from.id);
-    const groups = await syncGroups(db, tid, flow.accountId!) as Array<{ chatId: string; title: string }>;
-    const rows = groups.slice(0, 25).map((group, index) => [button(String(index + 1), `target:${created.id}:${group.chatId}`)]);
-    rows.push([button("Campaigns", "campaigns")]);
-    const names = groups.slice(0, 25).map((group, index) => `${index + 1}. ${escapeHtml(group.title)}`).join("\n");
-    await ctx.reply(`📢 <b>Campaign saved</b>\n${plan === "free" || plan === "starter" ? "Choose groups for delivery through IOAds." : "Select the groups that should receive this ad."}\n\n${names}`, { parse_mode: "HTML", reply_markup: menu(rows) });
+    try {
+      const msg = ctx.message;
+      const message = msg.text ?? msg.caption ?? "[Telegram media or rich message]";
+      const tid = tenantId(ctx.from.id);
+      if (!msg.text && config.archiveChat.replace(/^@/, "").toLowerCase() === config.forceJoinChat.replace(/^@/, "").toLowerCase())
+        throw new Error("Media ads need a dedicated ADS_ARCHIVE_CHAT. It cannot be the public group.");
+      const archived = msg.text ? null : await ctx.api.copyMessage(config.archiveChat || ctx.from.id, msg.chat.id, msg.message_id);
+      const created = createCampaign(db, tid, { name: message.slice(0, 50), message, senderAccountId: flow.accountId!, intervalSeconds: 300 }) as { id: number };
+      const inlineMedia = cachedInlineMedia(msg);
+      const entities = msg.entities ?? msg.caption_entities ?? [];
+      const hasCustomEmoji = entities.some((entity) => entity.type === "custom_emoji");
+      db.prepare("UPDATE campaigns SET messageEntities = ?, sourceChatId = ?, sourceMessageId = ?, richMessage = ?, contentKind=?, inlineMode = ? WHERE id = ? AND tenantId = ?")
+        .run(JSON.stringify(entities), archived ? config.archiveChat || String(ctx.from.id) : null, archived?.message_id ?? null, inlineMedia ? JSON.stringify(inlineMedia) : null, msg.text ? "text" : "media", archived && inlineMedia && config.botUsername && !hasCustomEmoji ? 1 : 0, created.id, tid);
+      flows.delete(ctx.from.id);
+      const groups = db.prepare("SELECT chatId,title FROM groups WHERE tenantId=? AND accountId=? ORDER BY title LIMIT 25")
+        .all(tid, flow.accountId!) as Array<{ chatId: string; title: string }>;
+      const rows = groups.map((group, index) => [button(String(index + 1), `target:${created.id}:${group.chatId}`)]);
+      rows.push([button("Choose groups / review", `campaigntargets:${created.id}`)]);
+      rows.push([button("Campaigns", "campaigns")]);
+      const names = groups.map((group, index) => `${index + 1}. ${escapeHtml(group.title)}`).join("\n");
+      await ctx.reply(`📢 <b>Campaign saved as a draft</b>\nSelect a group below, then tap <b>Schedule now</b>. Choose groups / review also lets you refresh the group list.\n\n${names || "No groups cached yet. Tap Choose groups / review, then Refresh groups."}`, { parse_mode: "HTML", reply_markup: menu(rows) });
+    } catch (error) {
+      await ctx.reply(`Could not save this campaign: ${escapeHtml(String(error instanceof Error ? error.message : error))}`, { parse_mode: "HTML", reply_markup: menu([[button("Cancel", "home")]]) });
+    }
   });
   bot.catch((error) => console.error(`ads bot update failed: ${String(error)}`));
-  void bot.start({ onStart: () => console.log("Ads bot started") });
+  let stopping = false;
+  let active: ReturnType<typeof run> | null = null;
+  const start = () => {
+    if (stopping) return;
+    const handle = run(bot, { runner: { fetch: { allowed_updates: ["message", "callback_query", "inline_query", "chat_member"] } }, sink: { concurrency: 128 } });
+    active = handle;
+    console.log("Ads bot started");
+    const task = handle.task();
+    if (task) void task.then(() => { if (!stopping) setTimeout(start, 1_000).unref(); })
+      .catch((error) => { console.error(`ads bot polling failed: ${String(error)}`); if (!stopping) setTimeout(start, 5_000).unref(); });
+  };
+  process.once("SIGTERM", () => { stopping = true; void active?.stop(); });
+  process.once("SIGINT", () => { stopping = true; void active?.stop(); });
+  start();
 }

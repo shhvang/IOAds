@@ -46,12 +46,10 @@ assert.equal(adapter.sent[0]?.message, "default");
 assert.equal((db.prepare("SELECT status FROM deliveries LIMIT 1").get() as { status: string }).status, "sent");
 const sourceCampaign = campaign as { id: number };
 db.prepare("UPDATE campaigns SET sourceChatId = ?, sourceMessageId = ?, nextRunAt = ? WHERE id = ?").run("archive", 9, "2000-01-01T00:00:00.000Z", sourceCampaign.id);
-let copied = false;
-await runSchedulerOnce(db, () => adapter, async (chatId, sourceChatId, messageId) => {
-  assert.deepEqual([chatId, sourceChatId, messageId], ["-100123", "archive", 9]);
-  copied = true;
-});
-assert.equal(copied, true);
+let copied: [string, string, number] | null = null;
+adapter.copyMessage = async (chatId, sourceChatId, messageId) => { copied = [chatId, sourceChatId, messageId]; };
+await runSchedulerOnce(db, () => adapter);
+assert.deepEqual(copied, ["-100123", "archive", 9]);
 db.prepare("UPDATE accounts SET telegramUserId = ? WHERE tenantId = ? AND accountId = ?").run(987654, "tenant-a", accountId);
 db.prepare("UPDATE campaigns SET inlineMode = 1, nextRunAt = ? WHERE id = ?").run("2001-01-01T00:00:00.000Z", sourceCampaign.id);
 await runSchedulerOnce(db, () => adapter);

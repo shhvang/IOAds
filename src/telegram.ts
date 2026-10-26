@@ -20,9 +20,10 @@ export interface TelegramAdapter {
   dialogs(): Promise<TelegramDialog[]>;
   canPost(chatId: string): Promise<boolean>;
   sendMessage(chatId: string, message: string, entities?: Array<Record<string, unknown>>): Promise<void>;
-  copyMessage(chatId: string, sourceChatId: string, messageId: number): Promise<void>;
+  copyMessage(chatId: string, sourceChatId: string, messageId: number, requiresPremium?: boolean): Promise<void>;
   sendInline(chatId: string, query: string): Promise<void>;
   logout(): Promise<void>;
+  close(): Promise<void>;
 }
 
 type AuthType = "phone" | "code" | "password";
@@ -36,6 +37,29 @@ function chatId(value: string): number {
   return id;
 }
 
+function tdEntities(entities: Array<Record<string, unknown>>): Td.textEntity[] {
+  const simple: Record<string, Td.TextEntityType> = {
+    mention: { _: "textEntityTypeMention" }, hashtag: { _: "textEntityTypeHashtag" }, cashtag: { _: "textEntityTypeCashtag" },
+    bot_command: { _: "textEntityTypeBotCommand" }, url: { _: "textEntityTypeUrl" }, email: { _: "textEntityTypeEmailAddress" },
+    phone_number: { _: "textEntityTypePhoneNumber" }, bold: { _: "textEntityTypeBold" }, italic: { _: "textEntityTypeItalic" },
+    underline: { _: "textEntityTypeUnderline" }, strikethrough: { _: "textEntityTypeStrikethrough" }, spoiler: { _: "textEntityTypeSpoiler" },
+    code: { _: "textEntityTypeCode" }, pre: { _: "textEntityTypePre" }, blockquote: { _: "textEntityTypeBlockQuote" },
+    expandable_blockquote: { _: "textEntityTypeExpandableBlockQuote" },
+  };
+  const result: Td.textEntity[] = [];
+  for (const entity of entities) {
+    const offset = Number(entity.offset), length = Number(entity.length);
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length <= 0) continue;
+    let type = simple[String(entity.type)];
+    if (entity.type === "text_link" && typeof entity.url === "string") type = { _: "textEntityTypeTextUrl", url: entity.url };
+    if (entity.type === "text_mention" && entity.user && typeof entity.user === "object" && Number.isSafeInteger((entity.user as { id?: number }).id)) type = { _: "textEntityTypeMentionName", user_id: (entity.user as { id: number }).id };
+    if (entity.type === "custom_emoji" && entity.custom_emoji_id) type = { _: "textEntityTypeCustomEmoji", custom_emoji_id: String(entity.custom_emoji_id) };
+    if (entity.type === "pre" && typeof entity.language === "string") type = { _: "textEntityTypePreCode", language: entity.language };
+    if (type) result.push({ _: "textEntity", offset, length, type });
+  }
+  return result;
+}
+
 export function createTelegramAdapter(accountId: string): TelegramAdapter {
   if (!config.telegramApiId || !config.telegramApiHash) throw new Error("TELEGRAM_API_ID and TELEGRAM_API_HASH are required");
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before login");
@@ -43,6 +67,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
   mkdirSync(directory, { recursive: true });
   let client: Client | null = null;
   let userId = 0;
+  let userPremium = false;
   let authReadyDone = false;
   let previouslyAuthorized = false;
   let authError: Error | null = null;
@@ -55,6 +80,36 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
   let authReadyResolve!: () => void;
   let authReadyReject!: (error: Error) => void;
   const authReady = new Promise<void>((resolve, reject) => { authReadyResolve = resolve; authReadyReject = reject; });
+  void authReady.catch(() => undefined);
+  const sendWaiters = new Map<number, { resolve(): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
+  const sendResults = new Map<number, { error: Error | null; at: number }>();
+  const sendError = (code: number, message: string): Error => new Error(`Telegram ${code}: ${message}`);
+  const finishSend = (temporaryId: number, error: Error | null): void => {
+    const waiter = sendWaiters.get(temporaryId);
+    if (waiter) {
+      clearTimeout(waiter.timer);
+      sendWaiters.delete(temporaryId);
+      if (error) waiter.reject(error); else waiter.resolve();
+    } else sendResults.set(temporaryId, { error, at: Date.now() });
+    if (sendResults.size > 1000) for (const [id, result] of sendResults) if (Date.now() - result.at > 60_000) sendResults.delete(id);
+  };
+  const confirmed = async (message: Td.message): Promise<void> => {
+    if (message.sending_state?._ === "messageSendingStateFailed") throw sendError(message.sending_state.error.code, message.sending_state.error.message);
+    if (message.sending_state?._ !== "messageSendingStatePending") return;
+    const result = sendResults.get(message.id);
+    if (result) {
+      sendResults.delete(message.id);
+      if (result.error) throw result.error;
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        sendWaiters.delete(message.id);
+        reject(new Error("sender confirmation timeout"));
+      }, 65_000);
+      sendWaiters.set(message.id, { resolve, reject, timer });
+    });
+  };
   const ask = (type: AuthType): Promise<string> => {
     const value = authInputs.get(type);
     if (value !== undefined) { authInputs.delete(type); return Promise.resolve(value); }
@@ -84,11 +139,12 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
     databaseEncryptionKey: config.sessionEncryptionKey,
   });
   client = td;
-  td.on("error", (error) => { console.log(`[${accountId}] TDLib error:`, error); authError = error; authReadyReject(error); });
+  td.on("error", (error) => { authError = error; authReadyReject(error); });
   td.on("update", (update) => {
+    if (update._ === "updateMessageSendSucceeded") finishSend(update.old_message_id, null);
+    if (update._ === "updateMessageSendFailed") finishSend(update.old_message_id, sendError(update.error.code, update.error.message));
     if (update._ === "updateAuthorizationState") {
       const state = update.authorization_state;
-      console.log(`[${accountId}] auth state: ${state._}`);
       if (state._ === "authorizationStateWaitPhoneNumber") setPhase("phone");
       if (state._ === "authorizationStateWaitCode") setPhase("code");
       if (state._ === "authorizationStateWaitPassword") setPhase("password");
@@ -96,7 +152,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       if (state._ === "authorizationStateReady") {
         setPhase("ready");
         previouslyAuthorized = true;
-        void td.invoke({ _: "getMe" }).then((me) => { userId = me.id; authReadyDone = true; authReadyResolve(); }).catch(authReadyReject);
+        void td.invoke({ _: "getMe" }).then((me) => { userId = me.id; userPremium = me.is_premium; authReadyDone = true; authReadyResolve(); }).catch(authReadyReject);
       }
     }
   });
@@ -111,82 +167,94 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
   const ready = async (): Promise<Client> => { await authReady; return td; };
   return {
     async sendCode(phone) {
-      console.log(`[${accountId}] sendCode called with phone=${phone.slice(0,4)}***`);
       await waitForPhase("phone", "closed");
-      console.log(`[${accountId}] phase is now ${authPhase}, previouslyAuthorized=${previouslyAuthorized}`);
       if (previouslyAuthorized) throw new Error("This account is already connected");
       if (authPhase !== "phone") throw new Error("Telegram is not ready for a phone number");
-      console.log(`[${accountId}] providing phone to TDLib`);
       provide("phone", phone);
-      console.log(`[${accountId}] waiting for 'code' phase...`);
       await waitForPhase("code", "closed");
-      console.log(`[${accountId}] phase is now ${authPhase}, authError=${authError?String(authError):'null'}`);
       if (authError) throw authError;
        if (currentPhase() === "closed") throw new Error("Telegram closed the login session");
-      console.log(`[${accountId}] sendCode success`);
       return { phoneCodeHash: "tdlib" };
     },
     async signIn(_phone, _hash, code, password) {
-      console.log(`[${accountId}] signIn called, authPhase=${authPhase}, password=${password?'[set]':'[none]'}`);
       authError = null;
       if (authPhase === "password") {
         if (!password) throw new Error("SESSION_PASSWORD_NEEDED");
-        console.log(`[${accountId}] waiting for password request...`);
         await new Promise((resolve) => setTimeout(resolve, 100));
         const request = authRequests.password;
-        console.log(`[${accountId}] providing password, request count=${request}`);
         provide("password", password);
         while (authRequests.password === request && !["ready", "closed"].includes(currentPhase())) await new Promise((resolve) => setTimeout(resolve, 50));
         if (authRequests.password > request) throw new Error("PASSWORD_HASH_INVALID");
       } else if (authPhase === "code") {
-        console.log(`[${accountId}] waiting briefly for TDLib callback to fire...`);
         await new Promise((resolve) => setTimeout(resolve, 100));
         const request = authRequests.code;
-        console.log(`[${accountId}] providing code, request count=${request}, authRequests.code=${authRequests.code}`);
         provide("code", code);
-        console.log(`[${accountId}] waiting for phase transition from ${authPhase}`);
         while (authRequests.code === request && !["ready", "password", "closed"].includes(currentPhase())) await new Promise((resolve) => setTimeout(resolve, 50));
-        console.log(`[${accountId}] wait ended, authRequests.code=${authRequests.code}, request=${request}, currentPhase=${currentPhase()}`);
         if (authRequests.code > request) throw new Error("PHONE_CODE_INVALID");
         if (currentPhase() === "password") throw new Error("SESSION_PASSWORD_NEEDED");
       } else throw new Error("Telegram is not waiting for a login code");
       if (currentPhase() === "closed") throw new Error("Telegram closed the login session");
-      console.log(`[${accountId}] waiting for ready...`);
       await ready();
-      console.log(`[${accountId}] signIn success, userId=${userId}`);
       return { session: `tdlib:${accountId}`, userId };
     },
     async dialogs() {
-      console.log(`[${accountId}] dialogs() called`);
       const current = await ready();
-      const chats = await current.invoke({ _: "getChats", chat_list: { _: "chatListMain" }, limit: 200 });
+      const ids = new Set<number>();
+      for (const chatList of [{ _: "chatListMain" } as const, { _: "chatListArchive" } as const]) {
+        while (true) {
+          try { await current.invoke({ _: "loadChats", chat_list: chatList, limit: 100 }); }
+          catch (error) {
+            if (/\b404\b/.test(String(error))) break;
+            throw error;
+          }
+        }
+        const chats = await current.invoke({ _: "getChats", chat_list: chatList, limit: 1_000_000 });
+        for (const id of chats.chat_ids) ids.add(id);
+      }
       const result: TelegramDialog[] = [];
-      for (const id of chats.chat_ids) {
-        const chat = await current.invoke({ _: "getChat", chat_id: id }) as TdChat;
-        if (chat.type._ !== "chatTypeBasicGroup" && chat.type._ !== "chatTypeSupergroup") continue;
-        result.push({ chatId: String(chat.id), title: chat.title, username: null });
+      const all = [...ids];
+      for (let offset = 0; offset < all.length; offset += 25) {
+        const batch = await Promise.all(all.slice(offset, offset + 25).map((id) => current.invoke({ _: "getChat", chat_id: id }) as Promise<TdChat>));
+        for (const chat of batch) {
+          if (chat.type._ !== "chatTypeBasicGroup" && chat.type._ !== "chatTypeSupergroup") continue;
+          result.push({ chatId: String(chat.id), title: chat.title, username: null });
+        }
       }
       return result;
     },
     async canPost(target) {
       const current = await ready(), id = chatId(target), chat = await current.invoke({ _: "getChat", chat_id: id });
+      const me = await current.invoke({ _: "getMe" });
+      const member = await current.invoke({ _: "getChatMember", chat_id: id, member_id: { _: "messageSenderUser", user_id: me.id } });
+      if (member.status._ === "chatMemberStatusCreator") return true;
+      if (member.status._ === "chatMemberStatusAdministrator")
+        return chat.type._ !== "chatTypeSupergroup" || !chat.type.is_channel || member.status.rights.can_post_messages;
       if (chat.type._ === "chatTypeSupergroup" && chat.type.is_channel) {
-        const me = await current.invoke({ _: "getMe" });
-        const member = await current.invoke({ _: "getChatMember", chat_id: id, member_id: { _: "messageSenderUser", user_id: me.id } });
-        if (member.status._ === "chatMemberStatusCreator") return true;
-        return member.status._ === "chatMemberStatusAdministrator" && member.status.rights.can_post_messages;
+        return false;
       }
-      return chat.permissions.can_send_basic_messages;
+      if (member.status._ === "chatMemberStatusRestricted") return member.status.is_member && member.status.permissions.can_send_basic_messages;
+      return member.status._ === "chatMemberStatusMember" && chat.permissions.can_send_basic_messages;
     },
     async sendMessage(target, message, entities) {
       const current = await ready();
-      const formatted = entities?.length ? { _: "formattedText" as const, text: message, entities: entities as Td.textEntity[] } : { _: "formattedText" as const, text: message, entities: [] };
-      await current.invoke({ _: "sendMessage", chat_id: chatId(target), input_message_content: { _: "inputMessageText", text: formatted, clear_draft: false } });
+      const formatted = { _: "formattedText" as const, text: message, entities: entities?.length ? tdEntities(entities) : [] };
+      if (!userPremium && formatted.entities.some((entity) => entity.type._ === "textEntityTypeCustomEmoji"))
+        throw new Error("Connected Telegram account needs Premium to send custom emoji. Choose a Premium account or remove the custom emoji.");
+      const sent = await current.invoke({ _: "sendMessage", chat_id: chatId(target), input_message_content: { _: "inputMessageText", text: formatted, clear_draft: false } });
+      await confirmed(sent);
     },
-    async copyMessage(target, sourceChat, messageId) {
+    async copyMessage(target, sourceChat, messageId, requiresPremium) {
       const current = await ready();
-      const copied = await current.invoke({ _: "forwardMessages", chat_id: chatId(target), from_chat_id: chatId(sourceChat), message_ids: [messageId], send_copy: true, remove_caption: false });
+      if (requiresPremium && !userPremium)
+        throw new Error("Connected Telegram account needs Premium to send custom emoji. Choose a Premium account or remove the custom emoji.");
+      const sourceId = sourceChat.startsWith("@")
+        ? (await current.invoke({ _: "searchPublicChat", username: sourceChat.slice(1) })).id
+        : chatId(sourceChat);
+      const tdMessageId = messageId * 1_048_576;
+      if (!Number.isSafeInteger(tdMessageId)) throw new Error("invalid archive message id");
+      const copied = await current.invoke({ _: "forwardMessages", chat_id: chatId(target), from_chat_id: sourceId, message_ids: [tdMessageId], send_copy: true, remove_caption: false });
       if (!copied.messages[0]) throw new Error("Telegram could not copy this message");
+      await confirmed(copied.messages[0]);
     },
     async sendInline(target, query) {
       const current = await ready();
@@ -194,7 +262,8 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       const results = await current.invoke({ _: "getInlineQueryResults", bot_user_id: bot.id, chat_id: chatId(target), query, offset: "" });
       const result = results.results[0];
       if (!result) throw new Error("inline campaign result unavailable");
-      await current.invoke({ _: "sendInlineQueryResultMessage", chat_id: chatId(target), query_id: results.inline_query_id, result_id: result.id, hide_via_bot: false });
+      const sent = await current.invoke({ _: "sendInlineQueryResultMessage", chat_id: chatId(target), query_id: results.inline_query_id, result_id: result.id, hide_via_bot: false });
+      await confirmed(sent);
     },
     async logout() {
       const current = client;
@@ -202,11 +271,27 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       authWaiters.clear();
       for (const type of ["phone", "code", "password"] as const) authInputs.delete(type);
       for (const waiter of phaseWaiters.splice(0)) waiter.resolve();
+      for (const waiter of sendWaiters.values()) { clearTimeout(waiter.timer); waiter.reject(new Error("sender client closed")); }
+      sendWaiters.clear();
+      sendResults.clear();
       setPhase("closed");
       if (!current || current.isClosed()) { client = null; return; }
       try {
         if (authReadyDone) await current.invoke({ _: "logOut" });
       } finally { await current.close(); client = null; rmSync(directory, { recursive: true, force: true }); }
+    },
+    async close() {
+      const current = client;
+      for (const waiter of authWaiters.values()) waiter.reject(new Error("sender client closed"));
+      authWaiters.clear();
+      for (const type of ["phone", "code", "password"] as const) authInputs.delete(type);
+      for (const waiter of phaseWaiters.splice(0)) waiter.resolve();
+      for (const waiter of sendWaiters.values()) { clearTimeout(waiter.timer); waiter.reject(new Error("sender client closed")); }
+      sendWaiters.clear();
+      sendResults.clear();
+      setPhase("closed");
+      if (current && !current.isClosed()) await current.close();
+      client = null;
     },
   };
 }
@@ -223,4 +308,5 @@ export class FakeTelegramAdapter implements TelegramAdapter {
   async copyMessage(chatId: string, _sourceChatId: string, _messageId: number): Promise<void> { this.sent.push({ chatId, message: "[copied message]" }); }
   async sendInline(chatId: string, query: string): Promise<void> { this.inlineSent.push({ chatId, query }); }
   async logout(): Promise<void> {}
+  async close(): Promise<void> {}
 }
