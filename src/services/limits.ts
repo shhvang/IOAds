@@ -37,6 +37,10 @@ export function limitFor(db: Database.Database, tenantId: string, key: keyof Lim
   return tenantLimits(db, tenantId)[key];
 }
 
+export function isTenantBlocked(db: Database.Database, tenantId: string): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM localUsers WHERE tenantId=? AND blocked=1").get(tenantId));
+}
+
 /** Existing sessions must obey the same owner/account rule as new logins. */
 export function revokeOwnerAccounts(db: Database.Database, tenantId?: string): number {
   const rows = db.prepare(`SELECT a.tenantId,a.accountId FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId

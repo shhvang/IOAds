@@ -64,6 +64,10 @@ export function stopWorkerPool(): void {
   }
 }
 
+export function workerPoolStatus(): Array<{ index: number; running: boolean; pending: number; failures: number; restarting: boolean }> {
+  return (shards ?? []).map((shard, index) => ({ index, running: Boolean(shard.child?.connected), pending: shard.pending.size, failures: shard.failures, restarting: Boolean(shard.restart) }));
+}
+
 function call(accountId: string, method: Method, args: unknown[]): Promise<any> {
   if (!shards) throw new Error("sender workers are unavailable");
   const digest = createHash("sha256").update(accountId).digest();
@@ -74,8 +78,8 @@ function call(accountId: string, method: Method, args: unknown[]): Promise<any> 
     const timer = setTimeout(() => {
       shard.pending.delete(id);
       reject(new Error("sender worker timeout"));
-      shard.child?.kill("SIGKILL");
-    }, 75_000);
+      if (method !== "close") shard.child?.kill("SIGKILL");
+    }, method === "close" ? 15_000 : 75_000);
     shard.pending.set(id, { resolve, reject, timer });
     shard.child!.send({ id, accountId, method, args }, (error) => {
       if (!error) return;

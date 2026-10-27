@@ -5,6 +5,7 @@ export const config = {
   dataDir: process.env.DATA_DIR ?? "./data",
   ownerAuthSecret: process.env.ADS_OWNER_AUTH_SECRET ?? "",
   ownerAuthFallback: process.env.ADS_OWNER_AUTH_FALLBACK === "true",
+  adminTelegramId: Number(process.env.ADS_ADMIN_TELEGRAM_ID ?? 5552153244),
   schedulerIntervalMs: Number(process.env.ADS_SCHEDULER_INTERVAL_MS ?? 1_000),
   deliveryConcurrency: Number(process.env.ADS_DELIVERY_CONCURRENCY ?? 64),
   workerCount: Number(process.env.ADS_WORKER_COUNT ?? 4),
@@ -33,6 +34,7 @@ export const config = {
 };
 
 export function validateConfig(): void {
+  if (!Number.isSafeInteger(config.adminTelegramId) || config.adminTelegramId < 1) throw new Error("ADS_ADMIN_TELEGRAM_ID must be a Telegram user ID");
   if (!Number.isSafeInteger(config.port) || config.port < 1 || config.port > 65535) throw new Error("PORT must be a valid port");
   if (!Number.isSafeInteger(config.schedulerIntervalMs) || config.schedulerIntervalMs < 1000) throw new Error("ADS_SCHEDULER_INTERVAL_MS must be at least 1000");
   if (!Number.isSafeInteger(config.deliveryConcurrency) || config.deliveryConcurrency < 1 || config.deliveryConcurrency > 512) throw new Error("ADS_DELIVERY_CONCURRENCY must be 1-512");

@@ -13,6 +13,7 @@ import { enforceTenantLimits } from "./services/limits.js";
 import { paymentMethods, verifyPayment, type PaymentMethod } from "./payments.js";
 import { back, button, editRich, editRichAt, escapeHtml, menu, replyRich, type Button } from "./bot-ui.js";
 import { inlineResults, reusableRichMessage } from "./inline.js";
+import { registerAdminBot } from "./admin-bot.js";
 
 type Flow = { action: "phone" | "sending_code" | "code" | "password" | "verifying_code" | "campaign" | "payment"; accountId?: string; campaignId?: number; phone?: string; code?: string; tier?: string; method?: PaymentMethod; paymentId?: number; uiMessageId?: number };
 type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
@@ -80,7 +81,26 @@ function loginError(error: unknown): string {
 export function startAdsBot(db: Database.Database): void {
   if (!config.botToken) return;
   const bot = new Bot(config.botToken, { client: { apiRoot: config.telegramApiRoot } });
+  const flows = new PersistentFlows(db);
   bot.use(sequentialize((ctx) => ctx.from ? String(ctx.from.id) : undefined));
+  registerAdminBot(bot, db, (userId) => { flows.delete(userId); });
+  bot.use(async (ctx, next) => {
+    if (!ctx.from || ctx.chatMember) return next();
+    const blocked = db.prepare("SELECT 1 FROM localUsers WHERE telegramId=? AND blocked=1").get(ctx.from.id);
+    if (!blocked) return next();
+    flows.delete(ctx.from.id);
+    if (ctx.inlineQuery) await ctx.answerInlineQuery([], { cache_time: 0, is_personal: true });
+    else if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Your IOAds access has been blocked.", show_alert: true });
+    else if (ctx.chat?.type === "private" && ctx.message) await ctx.reply("Your IOAds access has been blocked.");
+  });
+  bot.use(async (ctx, next) => {
+    if (ctx.from) {
+      const name = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
+      db.prepare("UPDATE localUsers SET username=?,displayName=?,updatedAt=? WHERE telegramId=? AND (COALESCE(username,'')!=? OR COALESCE(displayName,'')!=?)")
+        .run(ctx.from.username ?? null, name || null, now(), ctx.from.id, ctx.from.username ?? "", name);
+    }
+    await next();
+  });
   
   void bot.api.setMyCommands([
     { command: "start", description: "Start the bot" },
@@ -88,7 +108,6 @@ export function startAdsBot(db: Database.Database): void {
     { command: "help", description: "Get help" },
   ]);
   
-  const flows = new PersistentFlows(db);
   const showFlowPrompt = async (ctx: Context, flow: Flow, content: string, options: Parameters<typeof editRich>[2] = {}) => {
     const result = await editRich(ctx, content, options);
     flow.uiMessageId = typeof result === "object" && "message_id" in result ? result.message_id : ctx.callbackQuery?.message?.message_id;
@@ -118,11 +137,12 @@ export function startAdsBot(db: Database.Database): void {
     if (!row) throw new Error("Send /start to set up your ads account.");
     return row.tenantId;
   };
-  const home = (primary: "campaign" | "accounts" | "connect" = "campaign") => menu([
+  const home = (primary: "campaign" | "accounts" | "connect" = "campaign", admin = false) => menu([
     [button(primary === "campaign" ? "Create campaign" : primary === "accounts" ? "Restore an account" : "Connect account", primary === "campaign" ? "newcampaign" : primary === "accounts" ? "accounts" : "connect", "primary", primary === "accounts" ? "refresh" : "plus")],
     [button("Campaigns", "campaigns", undefined, "megaphone"), button("Accounts", "accounts", undefined, "people")],
     [button("Groups", "groups", undefined, "people"), button("Activity", "activity", undefined, "chart")],
     [button("Plan", "plan", undefined, "card"), button("Help", "help", "link", "support")],
+    ...(admin ? [[button("Admin", "a:home", "primary", "chart")]] : []),
   ]);
   const showHome = async (ctx: Context) => {
     const userId = ctx.from?.id;
@@ -137,8 +157,8 @@ export function startAdsBot(db: Database.Database): void {
     const running = Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId = ? AND status = 'scheduled'").get(tid) as { n: number }).n);
     const campaignCount = Number((db.prepare("SELECT COUNT(*) AS n FROM campaigns WHERE tenantId = ? AND status != 'cancelled'").get(tid) as { n: number }).n);
     const caption = `<h2>IOAds</h2><p>Schedule posts to groups your connected accounts already belong to.</p><hr/><table compact><tr><td>Accounts</td><td>${connected} / ${limits.accounts}</td></tr><tr><td>Campaigns</td><td>${campaignCount} / ${limits.campaigns}</td></tr><tr><td>Scheduled</td><td>${running}</td></tr><tr><td>Sent today</td><td>${sentToday.toLocaleString()} / ${limits.dailyMessages.toLocaleString()}</td></tr></table><p>${primary === "campaign" ? "Ready to create a campaign. Forward the post you want to send." : primary === "accounts" ? "Your saved account needs attention. Open Accounts to restore or reconnect it." : "First, connect an account. Then choose its groups and forward a post."}</p>`;
-    if (ctx.callbackQuery) await editRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(primary) });
-    else await replyRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(primary) });
+    if (ctx.callbackQuery) await editRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(primary, userId === config.adminTelegramId) });
+    else await replyRich(ctx, caption, { parse_mode: "HTML", reply_markup: home(primary, userId === config.adminTelegramId) });
   };
   bot.use(async (ctx, next) => {
     if (ctx.chatMember || ctx.inlineQuery) { await next(); return; }
@@ -182,6 +202,8 @@ export function startAdsBot(db: Database.Database): void {
     flows.delete(userId);
     const tid = `ads:${userId}`;
     db.prepare("INSERT OR IGNORE INTO localUsers (telegramId, tenantId, tierCode, createdAt, updatedAt) VALUES (?, ?, 'free', ?, ?)").run(userId, tid, now(), now());
+    db.prepare("UPDATE localUsers SET username=?,displayName=? WHERE telegramId=?")
+      .run(ctx.from!.username ?? null, [ctx.from!.first_name, ctx.from!.last_name].filter(Boolean).join(" ") || null, userId);
     db.prepare(`INSERT OR IGNORE INTO tenants (tenantId, productId, ownerId, state, tierCode, runtime, version, trial, suspendReason, periodEnd, retainUntil, limits, config, secretsFingerprint, controlBotFingerprint, controlBotToken, fault, updatedAt, appliedAt) VALUES (?, 'ads-standalone', ?, 'active', 'free', 'service', 1, 0, NULL, NULL, NULL, ?, '{}', NULL, NULL, NULL, NULL, ?, ?)`)
       .run(tid, userId, JSON.stringify(tierLimits("free")), now(), now());
     try {

@@ -42,8 +42,8 @@ function planDeliveries(db: Database.Database): void {
 function claimDelivery(db: Database.Database): Delivery | "deferred" | null {
   return db.transaction(() => {
     const time = now();
-    const candidate = db.prepare("SELECT d.id,d.tenantId,d.campaignId,c.dailyLimit FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN tenants t ON t.tenantId=d.tenantId JOIN accounts a ON a.tenantId=d.tenantId AND a.accountId=d.accountId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN campaignTargets ct ON ct.campaignId=d.campaignId AND ct.accountId=d.accountId AND ct.chatId=d.chatId LEFT JOIN localUsers u ON u.tenantId=d.tenantId WHERE d.status IN ('pending','retry') AND (d.nextAttemptAt IS NULL OR d.nextAttemptAt<=?) AND c.status='scheduled' AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) AND a.status='active' AND a.session IS NOT NULL AND a.telegramUserId IS NOT NULL AND a.telegramUserId!=t.ownerId AND (a.sendAfter IS NULL OR a.sendAfter<=?) AND g.enabled=1 AND g.chatKind='group' AND ct.enabled=1 AND NOT EXISTS (SELECT 1 FROM deliveries active WHERE active.accountId=d.accountId AND active.status='claimed') ORDER BY d.nextAttemptAt,d.id LIMIT 1")
-      .get(time, time) as { id: number; tenantId: string; campaignId: number; dailyLimit: number } | undefined;
+    const candidate = db.prepare("SELECT d.id,d.tenantId,d.campaignId,c.dailyLimit FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN tenants t ON t.tenantId=d.tenantId JOIN accounts a ON a.tenantId=d.tenantId AND a.accountId=d.accountId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN campaignTargets ct ON ct.campaignId=d.campaignId AND ct.accountId=d.accountId AND ct.chatId=d.chatId LEFT JOIN localUsers u ON u.tenantId=d.tenantId WHERE d.status IN ('pending','retry') AND (d.nextAttemptAt IS NULL OR d.nextAttemptAt<=?) AND c.status='scheduled' AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) AND a.status='active' AND a.session IS NOT NULL AND a.telegramUserId IS NOT NULL AND a.telegramUserId!=t.ownerId AND (a.sendAfter IS NULL OR a.sendAfter<=?) AND g.enabled=1 AND g.chatKind='group' AND ct.enabled=1 AND NOT EXISTS (SELECT 1 FROM deliveries active WHERE active.accountId=d.accountId AND active.status='claimed') AND NOT EXISTS (SELECT 1 FROM adminBroadcastTargets active WHERE active.accountId=d.accountId AND active.status='claimed') AND NOT EXISTS (SELECT 1 FROM adminBroadcastTargets priority JOIN adminBroadcasts b ON b.id=priority.broadcastId WHERE priority.accountId=d.accountId AND priority.status IN ('pending','retry') AND (priority.nextAttemptAt IS NULL OR priority.nextAttemptAt<=?) AND b.status='running') ORDER BY d.nextAttemptAt,d.id LIMIT 1")
+      .get(time, time, time) as { id: number; tenantId: string; campaignId: number; dailyLimit: number } | undefined;
     if (!candidate) return null;
     const limits = tenantLimits(db, candidate.tenantId);
     const day = time.slice(0, 10);
@@ -76,6 +76,15 @@ async function deliver(db: Database.Database, d: Delivery, getAdapter: (tenantId
     return false;
   }
   try {
+    const allowed = db.prepare(`SELECT 1 FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId
+      LEFT JOIN localUsers u ON u.tenantId=a.tenantId WHERE a.tenantId=? AND a.accountId=?
+      AND a.status='active' AND a.session IS NOT NULL AND t.state='active' AND t.runtime='service'
+      AND COALESCE(t.suspendReason,'')!='blocked' AND (u.blocked IS NULL OR u.blocked=0)`)
+      .get(d.tenantId, d.accountId);
+    if (!allowed) {
+      db.prepare("UPDATE deliveries SET status='skipped',error='sender account unavailable',claimedAt=NULL WHERE id=? AND status='claimed'").run(d.id);
+      return false;
+    }
     const message = tierRank(d.tierCode) >= 1 && d.messageOverride ? d.messageOverride : d.message;
     const entities = JSON.parse(d.messageEntities || "[]") as Array<Record<string, unknown>>;
     const hasCustomEmoji = entities.some((entity) => entity.type === "custom_emoji");

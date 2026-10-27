@@ -74,6 +74,45 @@ TDLib clients to reduce memory use. The control bot uses concurrent polling;
 using a webhook for that one bot would not change user account delivery, which
 uses TDLib connections rather than Bot API polling.
 
+## Telegram admin
+
+The service operator uses the same Telegram bot as standalone users. Send
+`/admin` to it from a private chat. Admin access is checked against
+`ADS_ADMIN_TELEGRAM_ID` (default `5552153244`) on every update; the admin
+controls are not available in groups or to other Telegram accounts. The admin
+menu also appears on that account's public home screen after `/start`.
+
+The admin screens show fleet health, sender workers, tenants, bot users,
+accounts, enabled groups, campaigns, delivery failures, broadcast progress,
+and audit history. People can be chosen from paged lists, searched by name or
+username, or selected by forwarding one of their messages to the user search.
+The admin can grant Pro or Business for 30, 90, or 365 days, extending from
+the current paid expiry, and can revoke a grant. These grants apply only to
+standalone bot users; the rental hub remains authoritative for its tenants'
+subscriptions. The existing expiry sweep returns expired manual grants to Free.
+The same user screen can block or unblock a bot user. Blocking rejects their
+bot commands, callbacks, and inline queries; pauses all their connected
+userbots without deleting encrypted sessions; and skips queued campaign and
+admin broadcast sends. Unblocking restores eligible accounts within the
+current plan limits. Posts already accepted by Telegram cannot be recalled.
+
+To broadcast, choose **Broadcasts → New broadcast**, then send or forward one
+post and confirm one of three audiences:
+
+1. Every standalone bot user who started the bot.
+2. Those bot users plus enabled groups on Free or Starter userbot accounts.
+3. Those bot users plus enabled groups on all active userbot accounts.
+
+Group destinations are deduplicated across accounts so a group receives one
+admin post per broadcast. The selected recipients are saved as durable jobs.
+The bot copies the original post to bot users; userbots send formatted text or
+copy media and rich posts from `ADS_ARCHIVE_CHAT`. Connected accounts need
+access to that archive for non-text broadcasts. Broadcasts can be paused or
+cancelled, show individual failures, and notify the admin when finished. Jobs
+retry transient errors with backoff. As with campaign deliveries, a crash
+after Telegram accepts a send but before SQLite records success can cause a
+retry and a duplicate post.
+
 ## Authentication boundary
 
 The rental hub collects an owner control-bot token and sends it through the

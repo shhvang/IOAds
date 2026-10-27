@@ -5,7 +5,7 @@ import { now } from "../db.js";
 import { seal } from "../lib/crypto.js";
 import { createTelegramAdapter, hasTdlibSession, removeTdlibSession, type TelegramAdapter } from "../telegram.js";
 import { remoteAdapterFor } from "./worker-pool.js";
-import { enforceTenantLimits, limitFor, revokeOwnerAccounts } from "./limits.js";
+import { enforceTenantLimits, isTenantBlocked, limitFor, revokeOwnerAccounts } from "./limits.js";
 
 const adapters = new Map<string, TelegramAdapter>();
 const testAdapters = new Map<string, TelegramAdapter>();
@@ -28,6 +28,18 @@ export function forgetAdapter(tenantId: string, accountId?: string): void {
   for (const testKey of [...testAdapters.keys()]) if (testKey.startsWith(`${tenantId}:`) && (!accountId || testKey === key(tenantId, accountId))) testAdapters.delete(testKey);
 }
 
+/** Close loaded clients without logging out, preserving encrypted TDLib sessions. */
+export async function quiesceTenantAdapters(db: Database.Database, tenantId: string): Promise<void> {
+  const rows = db.prepare("SELECT accountId FROM accounts WHERE tenantId=?").all(tenantId) as Array<{ accountId: string }>;
+  const results = await Promise.allSettled(rows.map(async ({ accountId }) => {
+    const adapterKey = key(tenantId, accountId);
+    const adapter = adapters.get(adapterKey) ?? testAdapters.get(adapterKey) ?? remoteAdapterFor(accountId);
+    adapters.delete(adapterKey);
+    await adapter?.close();
+  }));
+  for (const result of results) if (result.status === "rejected") console.error(`ads sender close failed for blocked tenant ${tenantId}: ${String(result.reason)}`);
+}
+
 export function accounts(db: Database.Database, tenantId: string): Array<{ accountId: string; status: string; phone: string | null; displayName: string | null; telegramUserId: number | null; createdAt: string }> {
   return db.prepare("SELECT accountId, status, phone, displayName, telegramUserId, createdAt FROM accounts WHERE tenantId = ? ORDER BY CASE WHEN status='active' THEN 0 WHEN status='limit_paused' THEN 1 ELSE 2 END, createdAt DESC, accountId").all(tenantId) as Array<{ accountId: string; status: string; phone: string | null; displayName: string | null; telegramUserId: number | null; createdAt: string }>;
 }
@@ -42,6 +54,7 @@ export function accountStatus(db: Database.Database, tenantId: string, accountId
 }
 
 export function activeAccount(db: Database.Database, tenantId: string, accountId: string): boolean {
+  if (isTenantBlocked(db, tenantId)) return false;
   const row = db.prepare("SELECT a.status,a.session,a.telegramUserId,t.ownerId FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId WHERE a.tenantId = ? AND a.accountId = ?").get(tenantId, accountId) as { status: string; session: string | null; telegramUserId: number | null; ownerId: number } | undefined;
   return row?.status === "active" && Boolean(row.session) && row.telegramUserId != null && row.telegramUserId !== row.ownerId;
 }
@@ -52,6 +65,7 @@ export function requireAccount(db: Database.Database, tenantId: string, accountI
 }
 
 export function adapterFor(db: Database.Database, tenantId: string, accountId: string): TelegramAdapter {
+  if (isTenantBlocked(db, tenantId)) throw new Error("user is blocked");
   const adapterKey = key(tenantId, accountId);
   const injected = testAdapters.get(adapterKey);
   if (injected) return injected;
@@ -86,6 +100,7 @@ export async function refreshAccountProfile(db: Database.Database, tenantId: str
 }
 
 export async function loginStart(db: Database.Database, tenantId: string, phone: string, requestedAccountId?: string): Promise<{ accountId: string; sent: true }> {
+  if (isTenantBlocked(db, tenantId)) throw new Error("user is blocked");
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before login");
   const accountId = requestedAccountId ?? randomUUID();
   const owned = db.prepare("SELECT tenantId, status, telegramUserId FROM accounts WHERE accountId = ?").get(accountId) as { tenantId: string; status: string; telegramUserId: number | null } | undefined;
@@ -127,12 +142,18 @@ export async function cancelLogin(db: Database.Database, tenantId: string, accou
 }
 
 export async function loginComplete(db: Database.Database, tenantId: string, accountId: string, phone: string, code: string, password?: string): Promise<void> {
+  if (isTenantBlocked(db, tenantId)) throw new Error("user is blocked");
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before login");
   const row = db.prepare("SELECT phoneCodeHash, status, loginPhone FROM accounts WHERE tenantId = ? AND accountId = ?").get(tenantId, accountId) as { phoneCodeHash: string | null; status: string; loginPhone: string | null } | undefined;
   if (row?.status !== "connecting" || !row.phoneCodeHash) throw new Error("login code was not requested");
   if (row.loginPhone !== phone) throw new Error("phone number does not match this login");
   const adapter = adapterFor(db, tenantId, accountId);
   const result = await adapter.signIn(phone, row.phoneCodeHash, code, password);
+  if (isTenantBlocked(db, tenantId)) {
+    await adapter.close().catch(() => undefined);
+    adapters.delete(key(tenantId, accountId));
+    throw new Error("user is blocked");
+  }
   if (result.userId === ownerId(db, tenantId)) {
     await adapter.logout().catch(() => undefined);
     adapters.delete(key(tenantId, accountId));
@@ -187,12 +208,14 @@ export function canRestoreAccount(db: Database.Database, tenantId: string, accou
 }
 
 export async function restoreAccount(db: Database.Database, tenantId: string, accountId: string): Promise<boolean> {
+  if (isTenantBlocked(db, tenantId)) throw new Error("user is blocked");
   if (!config.sessionEncryptionKey) throw new Error("SESSION_ENCRYPTION_KEY is required before recovery");
   if (!canRestoreAccount(db, tenantId, accountId)) throw new Error("No saved Telegram session is available. Connect the account again.");
   if (Number((db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE tenantId=? AND status IN ('active','connecting')").get(tenantId) as { n: number }).n) >= limitFor(db, tenantId, "accounts")) throw new Error("Account limit reached. Upgrade your plan or disconnect another account.");
   const adapter = adapterFor(db, tenantId, accountId);
   try {
     const resumed = await adapter.resumeSession();
+    if (isTenantBlocked(db, tenantId)) throw new Error("user is blocked");
     if (!resumed) { await adapter.close(); adapters.delete(key(tenantId, accountId)); return false; }
     if (resumed.userId === ownerId(db, tenantId)) throw new Error(ownerAccountError);
     const duplicate = db.prepare("SELECT 1 FROM accounts WHERE tenantId=? AND accountId!=? AND telegramUserId=? AND status IN ('active','limit_paused')")

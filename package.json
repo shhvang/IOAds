@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx src/ads.test.ts && tsx src/scheduler.test.ts && tsx src/rental/contract.test.ts",
+    "test": "tsx src/ads.test.ts && tsx src/scheduler.test.ts && tsx src/admin.test.ts && tsx src/rental/contract.test.ts",
     "build": "tsc",
     "start": "node dist/index.js"
   },

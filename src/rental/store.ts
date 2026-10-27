@@ -59,6 +59,8 @@ export function applyDesired(db: Database.Database, desired: TenantDesiredState)
   if (verdict === "noop") return verdict;
   if (desired.state === "purged") {
     db.transaction(() => {
+      db.prepare("DELETE FROM adminBroadcastTargets WHERE tenantId = ?").run(desired.tenantId);
+      db.prepare("DELETE FROM adminActions WHERE subject = ?").run(desired.tenantId);
       db.prepare("DELETE FROM deliveries WHERE tenantId = ?").run(desired.tenantId);
       db.prepare("DELETE FROM campaignTargets WHERE tenantId = ?").run(desired.tenantId);
       db.prepare("DELETE FROM campaigns WHERE tenantId = ?").run(desired.tenantId);

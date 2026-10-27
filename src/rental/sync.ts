@@ -50,6 +50,8 @@ async function syncEntitlementsOnce(db: Database.Database, full: boolean): Promi
     const remove = db.transaction(() => {
       for (const tenant of db.prepare("SELECT tenantId, version FROM tenants WHERE productId = 'ads'").all() as Array<{ tenantId: string; version: number }>) {
         if (!seen.has(tenant.tenantId)) {
+          db.prepare("DELETE FROM adminBroadcastTargets WHERE tenantId = ?").run(tenant.tenantId);
+          db.prepare("DELETE FROM adminActions WHERE subject = ?").run(tenant.tenantId);
           db.prepare("DELETE FROM tenants WHERE tenantId = ?").run(tenant.tenantId);
           db.prepare("INSERT INTO tombstones (tenantId, version) VALUES (?, ?) ON CONFLICT(tenantId) DO UPDATE SET version = excluded.version").run(tenant.tenantId, tenant.version);
         }

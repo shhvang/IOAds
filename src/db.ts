@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS tenants (
   fault TEXT, updatedAt TEXT NOT NULL, appliedAt TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tenants_owner ON tenants(ownerId);
-CREATE TABLE IF NOT EXISTS localUsers (telegramId INTEGER PRIMARY KEY, tenantId TEXT NOT NULL UNIQUE, tierCode TEXT NOT NULL DEFAULT 'free', paidUntil TEXT, forceJoined INTEGER NOT NULL DEFAULT 0, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS localUsers (telegramId INTEGER PRIMARY KEY, tenantId TEXT NOT NULL UNIQUE, tierCode TEXT NOT NULL DEFAULT 'free', paidUntil TEXT, forceJoined INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0, username TEXT, displayName TEXT, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS botFlows (telegramId INTEGER PRIMARY KEY, data TEXT NOT NULL, updatedAt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS planPayments (id INTEGER PRIMARY KEY, telegramId INTEGER NOT NULL, tierCode TEXT NOT NULL, network TEXT NOT NULL, amount REAL NOT NULL, reference TEXT NOT NULL UNIQUE, externalId TEXT UNIQUE, createdAt TEXT NOT NULL, expiresAt TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
 CREATE TABLE IF NOT EXISTS accounts (
@@ -70,6 +70,28 @@ CREATE TABLE IF NOT EXISTS audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT, tenantId TEXT NOT NULL, actorId INTEGER, action TEXT NOT NULL,
   detail TEXT, createdAt TEXT NOT NULL, FOREIGN KEY (tenantId) REFERENCES tenants(tenantId) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS adminBroadcasts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, audience INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'draft',
+  sourceChatId TEXT NOT NULL, sourceMessageId INTEGER NOT NULL, archiveChatId TEXT, archiveMessageId INTEGER,
+  message TEXT, entities TEXT NOT NULL DEFAULT '[]', contentKind TEXT NOT NULL,
+  createdAt TEXT NOT NULL, startedAt TEXT, finishedAt TEXT, notifiedAt TEXT
+);
+CREATE TABLE IF NOT EXISTS adminBroadcastTargets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, broadcastId INTEGER NOT NULL, kind TEXT NOT NULL,
+  tenantId TEXT, accountId TEXT, chatId TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0, nextAttemptAt TEXT, claimedAt TEXT, sentAt TEXT, error TEXT,
+  FOREIGN KEY (broadcastId) REFERENCES adminBroadcasts(id) ON DELETE CASCADE,
+  UNIQUE (broadcastId, kind, chatId)
+);
+CREATE INDEX IF NOT EXISTS admin_broadcast_due ON adminBroadcastTargets(status, nextAttemptAt, id);
+CREATE INDEX IF NOT EXISTS admin_broadcast_account ON adminBroadcastTargets(accountId, status, nextAttemptAt);
+CREATE TABLE IF NOT EXISTS adminActions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, actorId INTEGER NOT NULL, action TEXT NOT NULL,
+  subject TEXT, detail TEXT, createdAt TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS adminFlow (
+  actorId INTEGER PRIMARY KEY, action TEXT NOT NULL, updatedAt TEXT NOT NULL
+);
 `;
 
 export function openDb(path: string): Database.Database {
@@ -80,6 +102,12 @@ export function openDb(path: string): Database.Database {
   db.pragma("busy_timeout = 5000");
   migrateLegacyAccounts(db);
   db.exec(DDL);
+  const localColumns = new Set((db.prepare("PRAGMA table_info(localUsers)").all() as Array<{ name: string }>).map((column) => column.name));
+  if (!localColumns.has("username")) db.exec("ALTER TABLE localUsers ADD COLUMN username TEXT");
+  if (!localColumns.has("displayName")) db.exec("ALTER TABLE localUsers ADD COLUMN displayName TEXT");
+  if (!localColumns.has("blocked")) db.exec("ALTER TABLE localUsers ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0");
+  const broadcastColumns = new Set((db.prepare("PRAGMA table_info(adminBroadcasts)").all() as Array<{ name: string }>).map((column) => column.name));
+  if (!broadcastColumns.has("notifiedAt")) db.exec("ALTER TABLE adminBroadcasts ADD COLUMN notifiedAt TEXT");
   migrateCampaignTargetKeys(db);
   db.exec("CREATE INDEX IF NOT EXISTS campaign_targets_account ON campaignTargets(tenantId, campaignId, accountId, enabled)");
   const columns = db.prepare("PRAGMA table_info(deliveries)").all() as Array<{ name: string }>;
