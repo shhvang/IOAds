@@ -1,4 +1,4 @@
-import type { Bot, Context } from "grammy";
+import { InputFile, type Bot, type Context } from "grammy";
 import type Database from "better-sqlite3";
 import { config } from "./config.js";
 import { now } from "./db.js";
@@ -9,6 +9,8 @@ import { broadcastAudienceCounts, createAdminBroadcast, grantStandalonePlan, log
 import { workerPoolStatus } from "./services/worker-pool.js";
 import { schedulerProcessStatus } from "./services/scheduler-process.js";
 import { lastFeedSyncAt } from "./rental/sync.js";
+import { seal, unseal } from "./lib/crypto.js";
+import { adapterFor, refreshAccountProfile } from "./services/account.js";
 
 const e = escapeHtml;
 const pageSize = 7;
@@ -18,6 +20,22 @@ const n = (db: Database.Database, query: string, ...args: unknown[]): number => 
 type User = { telegramId: number; tenantId: string; tierCode: string; paidUntil: string | null; blocked: number; username: string | null; displayName: string | null; createdAt: string };
 type Tenant = { rowId: number; tenantId: string; ownerId: number; productId: string; state: string; tierCode: string; runtime: string; fault: string | null; updatedAt: string };
 type Campaign = { id: number; tenantId: string; name: string; status: string; nextRunAt: string | null; senderAccountId: string };
+type DirectoryGroup = { chatId: string; title: string; username: string | null; inviteCipher: string | null; firstSeenAt: string; lastSeenAt: string };
+
+export function telegramProfileLink(username: string | null, id: number, phone?: string | null): string {
+  if (username && /^[A-Za-z0-9_]{4,32}$/.test(username)) return `https://t.me/${username}`;
+  if (phone && /^\+[1-9]\d{6,14}$/.test(phone)) return `https://t.me/${phone}`;
+  return `tg://user?id=${id}`;
+}
+
+export function groupLink(group: Pick<DirectoryGroup, "username" | "inviteCipher">): string | null {
+  if (group.username && /^[A-Za-z0-9_]{4,32}$/.test(group.username)) return `https://t.me/${group.username}`;
+  if (!group.inviteCipher || !config.sessionEncryptionKey) return null;
+  try {
+    const url = unseal(group.inviteCipher, config.sessionEncryptionKey);
+    return /^https:\/\/t\.me\/(?:\+[A-Za-z0-9_-]+|joinchat\/[A-Za-z0-9_-]+)$/.test(url) ? url : null;
+  } catch { return null; }
+}
 
 export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?: (userId: number) => void): void {
   let userSearch = "", tenantSearch = "", failureSearch = "";
@@ -51,6 +69,7 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
     return render(ctx, `<h2>IOAds admin</h2><p>Service overview</p><table compact><tr><td>Bot users</td><td>${users}</td></tr><tr><td>Blocked users</td><td>${blockedUsers}</td></tr><tr><td>Tenants</td><td>${tenants}</td></tr><tr><td>Connected accounts</td><td>${connected}</td></tr><tr><td>Scheduled campaigns</td><td>${scheduled}</td></tr><tr><td>Campaign sends today</td><td>${sent}</td></tr><tr><td>Failed / retrying</td><td>${failed}</td></tr><tr><td>Scheduler</td><td>${scheduler.running ? "Running" : "Down"}</td></tr><tr><td>Sender workers</td><td>${workers.filter((w) => w.running).length} / ${workers.length}</td></tr><tr><td>Active broadcasts</td><td>${ongoing}</td></tr></table><p>Rental feed: ${e(date(lastFeedSyncAt()))}</p>`, [
       [button("Users & premium", "a:users:0", "primary", "people"), button("Tenants", "a:tenants:0", undefined, "people")],
       [button("Accounts", "a:accounts:0"), button("Campaigns", "a:campaigns:0")],
+      [button("All groups", "a:directory:0", "primary"), button("Export group links", "a:exportgroups")],
       [button("Delivery failures", "a:failures:0", undefined, "warning"), button("Broadcasts", "a:broadcasts:0", undefined, "megaphone")],
       [button("Audit", "a:audit:0"), button("Refresh", "a:home", "link", "refresh")],
       [back("home", "Public home")],
@@ -83,21 +102,20 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
   async function showUser(ctx: Context, userId: number): Promise<unknown> {
     let user = db.prepare("SELECT telegramId,tenantId,tierCode,paidUntil,blocked,username,displayName,createdAt FROM localUsers WHERE telegramId=?").get(userId) as User | undefined;
     if (!user) return users(ctx);
-    if (!user.displayName) {
-      try {
-        const chat = await ctx.api.getChat(user.telegramId);
-        if (chat.type === "private") {
-          const name = [chat.first_name, chat.last_name].filter(Boolean).join(" ");
-          db.prepare("UPDATE localUsers SET username=?,displayName=? WHERE telegramId=?").run(chat.username ?? null, name || null, userId);
-          user = { ...user, username: chat.username ?? null, displayName: name || null };
-        }
-      } catch { /* The user may have blocked the bot. */ }
-    }
+    try {
+      const chat = await ctx.api.getChat(user.telegramId);
+      if (chat.type === "private") {
+        const name = [chat.first_name, chat.last_name].filter(Boolean).join(" ");
+        db.prepare("UPDATE localUsers SET username=?,displayName=? WHERE telegramId=?").run(chat.username ?? null, name || null, userId);
+        user = { ...user, username: chat.username ?? null, displayName: name || null };
+      }
+    } catch { /* The user may have blocked the bot. */ }
     const accountCount = n(db, "SELECT COUNT(*) AS n FROM accounts WHERE tenantId=? AND status='active'", user.tenantId);
     const campaignCount = n(db, "SELECT COUNT(*) AS n FROM campaigns WHERE tenantId=? AND status='scheduled'", user.tenantId);
     const sent = n(db, "SELECT COUNT(*) AS n FROM deliveries WHERE tenantId=? AND status='sent' AND sentAt>=date('now')", user.tenantId);
     const tenantRow = db.prepare("SELECT rowid AS rowId FROM tenants WHERE tenantId=?").get(user.tenantId) as { rowId: number } | undefined;
-    return render(ctx, `<h2>${e(userName(user))}</h2><p>${user.username ? `@${e(user.username)}<br/>` : ""}Access: <b>${user.blocked ? "Blocked" : "Active"}</b><br/>Plan: <b>${e(user.tierCode)}</b><br/>Paid until: ${e(date(user.paidUntil))}<br/>Connected accounts: ${accountCount}<br/>Scheduled campaigns: ${campaignCount}<br/>Sends today: ${sent}</p>`, [
+    return render(ctx, `<h2>${e(userName(user))}</h2><p>Username: ${user.username ? `@${e(user.username)}` : "none"}<br/>Telegram ID: ${user.telegramId}<br/>Access: <b>${user.blocked ? "Blocked" : "Active"}</b><br/>Plan: <b>${e(user.tierCode)}</b><br/>Paid until: ${e(date(user.paidUntil))}<br/>Connected accounts: ${accountCount}<br/>Scheduled campaigns: ${campaignCount}<br/>Sends today: ${sent}</p>`, [
+      [{ text: "Open user in Telegram", url: telegramProfileLink(user.username, user.telegramId) }],
       [button("Grant Pro", `a:grant:${userId}:pro`, "success", "card"), button("Grant Business", `a:grant:${userId}:business`, "success", "card")],
       ...(user.tierCode !== "free" ? [[button("Revoke premium", `a:revoke:${userId}`, "danger")]] : []),
       ...(userId !== config.adminTelegramId ? [[button(user.blocked ? "Unblock user" : "Block user & userbots", `a:blockconfirm:${userId}:${user.blocked ? 0 : 1}`, user.blocked ? "success" : "danger")]] : []),
@@ -132,6 +150,7 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
     const sent = n(db, "SELECT COUNT(*) AS n FROM deliveries WHERE tenantId=? AND status='sent' AND sentAt>=date('now')", row.tenantId);
     const failed = n(db, "SELECT COUNT(*) AS n FROM deliveries WHERE tenantId=? AND status IN ('failed','retry')", row.tenantId);
     return render(ctx, `<h2>${e(user?.displayName || (user?.username ? `@${user.username}` : row.tenantId))}</h2><p>${e(row.productId)} · ${e(row.state)} · ${e(row.tierCode)}${user?.blocked ? " · <b>blocked by admin</b>" : ""}<br/>Runtime: ${e(row.runtime)}<br/>Connected accounts: ${accounts}<br/>Enabled groups: ${groups}<br/>Scheduled campaigns: ${campaigns}<br/>Sends today: ${sent}<br/>Failures / retries: ${failed}${row.fault ? `<br/>Fault: ${e(short(row.fault, 180))}` : ""}</p>`, [
+      [{ text: "Open owner in Telegram", url: telegramProfileLink(user?.username ?? null, row.ownerId) }],
       [button("Accounts", `a:ta:${rowId}:0`), button("Groups", `a:tg:${rowId}:0`)],
       [button("Campaigns", `a:tc:${rowId}:0`), button("Failures", `a:tf:${rowId}:0`, undefined, "warning")],
       [back("a:tenants:0", "Back to tenants")],
@@ -154,12 +173,19 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
   }
 
   async function showAccount(ctx: Context, rowId: number): Promise<unknown> {
-    const a = db.prepare("SELECT a.tenantId,a.accountId,a.displayName,a.phone,a.status,a.sendAfter,a.updatedAt,t.rowid AS tenantRow FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId WHERE a.rowid=?")
-      .get(rowId) as { tenantId: string; accountId: string; displayName: string | null; phone: string | null; status: string; sendAfter: string | null; updatedAt: string; tenantRow: number } | undefined;
+    let a = db.prepare("SELECT a.tenantId,a.accountId,a.displayName,a.username,a.telegramUserId,a.phone,a.status,a.sendAfter,a.updatedAt,t.rowid AS tenantRow FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId WHERE a.rowid=?")
+      .get(rowId) as { tenantId: string; accountId: string; displayName: string | null; username: string | null; telegramUserId: number | null; phone: string | null; status: string; sendAfter: string | null; updatedAt: string; tenantRow: number } | undefined;
+    if (!a) return accounts(ctx);
+    if (a.status === "active" && !a.username) {
+      try {
+        await refreshAccountProfile(db, a.tenantId, a.accountId);
+        a = db.prepare("SELECT a.tenantId,a.accountId,a.displayName,a.username,a.telegramUserId,a.phone,a.status,a.sendAfter,a.updatedAt,t.rowid AS tenantRow FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId WHERE a.rowid=?").get(rowId) as typeof a;
+      } catch { /* Saved identity remains available if Telegram is offline. */ }
+    }
     if (!a) return accounts(ctx);
     const groups = n(db, "SELECT COUNT(*) AS n FROM groups WHERE tenantId=? AND accountId=? AND enabled=1 AND chatKind='group'", a.tenantId, a.accountId);
     const failed = n(db, "SELECT COUNT(*) AS n FROM deliveries WHERE tenantId=? AND accountId=? AND status IN ('failed','retry')", a.tenantId, a.accountId);
-    return render(ctx, `<h2>${e(a.displayName || a.phone || "Telegram account")}</h2><p>Status: ${e(a.status)}<br/>Enabled groups: ${groups}<br/>Failed / retrying deliveries: ${failed}<br/>Rate limit ends: ${e(date(a.sendAfter))}<br/>Updated: ${e(date(a.updatedAt))}</p>`, [[button("Groups", `a:ag:${rowId}:0`), button("Failures", `a:af:${rowId}:0`)], [button("Tenant", `a:t:${a.tenantRow}`)], [back("a:accounts:0", "Back to accounts")]]);
+    return render(ctx, `<h2>${e(a.displayName || a.phone || "Telegram account")}</h2><p>Username: ${a.username ? `@${e(a.username)}` : "none"}<br/>Telegram ID: ${a.telegramUserId ?? "unknown"}<br/>Status: ${e(a.status)}<br/>Enabled groups: ${groups}<br/>Failed / retrying deliveries: ${failed}<br/>Rate limit ends: ${e(date(a.sendAfter))}<br/>Updated: ${e(date(a.updatedAt))}</p>`, [...(a.telegramUserId ? [[{ text: "Open userbot in Telegram", url: telegramProfileLink(a.username, a.telegramUserId, a.phone) }]] : []), [button("Groups", `a:ag:${rowId}:0`), button("Failures", `a:af:${rowId}:0`)], [button("Tenant", `a:t:${a.tenantRow}`)], [back("a:accounts:0", "Back to accounts")]]);
   }
 
   async function groups(ctx: Context, requested = 0, tenantRow?: number, accountRow?: number): Promise<unknown> {
@@ -180,12 +206,83 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
   }
 
   async function showGroup(ctx: Context, rowId: number): Promise<unknown> {
-    const g = db.prepare("SELECT g.tenantId,g.accountId,g.chatId,g.title,g.enabled,g.lastSentAt,a.rowid AS accountRow,t.rowid AS tenantRow FROM groups g JOIN accounts a ON a.tenantId=g.tenantId AND a.accountId=g.accountId JOIN tenants t ON t.tenantId=g.tenantId WHERE g.rowid=?")
-      .get(rowId) as { tenantId: string; accountId: string; chatId: string; title: string; enabled: number; lastSentAt: string | null; accountRow: number; tenantRow: number } | undefined;
+    const g = db.prepare("SELECT g.tenantId,g.accountId,g.chatId,g.title,g.username,g.enabled,g.lastSentAt,a.rowid AS accountRow,t.rowid AS tenantRow FROM groups g JOIN accounts a ON a.tenantId=g.tenantId AND a.accountId=g.accountId JOIN tenants t ON t.tenantId=g.tenantId WHERE g.rowid=?")
+      .get(rowId) as { tenantId: string; accountId: string; chatId: string; title: string; username: string | null; enabled: number; lastSentAt: string | null; accountRow: number; tenantRow: number } | undefined;
     if (!g) return tenants(ctx);
     const targets = n(db, "SELECT COUNT(*) AS n FROM campaignTargets WHERE tenantId=? AND accountId=? AND chatId=? AND enabled=1", g.tenantId, g.accountId, g.chatId);
     const failed = n(db, "SELECT COUNT(*) AS n FROM deliveries WHERE tenantId=? AND accountId=? AND chatId=? AND status IN ('failed','retry')", g.tenantId, g.accountId, g.chatId);
-    return render(ctx, `<h2>${e(g.title)}</h2><p>${g.enabled ? "Enabled" : "Disabled"}<br/>Campaign selections: ${targets}<br/>Failed / retrying sends: ${failed}<br/>Last sent: ${e(date(g.lastSentAt))}</p>`, [[button("Account", `a:acc:${g.accountRow}`), button("Tenant", `a:t:${g.tenantRow}`)], [back(`a:ag:${g.accountRow}:0`, "Back to groups")]]);
+    const directory = db.prepare("SELECT username,inviteCipher FROM groupDirectory WHERE chatId=?").get(g.chatId) as Pick<DirectoryGroup, "username" | "inviteCipher"> | undefined;
+    const link = directory ? groupLink(directory) : null;
+    return render(ctx, `<h2>${e(g.title)}</h2><p>Username: ${g.username ? `@${e(g.username)}` : "none"}<br/>Chat ID: ${e(g.chatId)}<br/>${g.enabled ? "Enabled" : "Disabled"}<br/>Campaign selections: ${targets}<br/>Failed / retrying sends: ${failed}<br/>Last sent: ${e(date(g.lastSentAt))}</p>`, [...(link ? [[{ text: "Open group in Telegram", url: link }]] : []), [button("Account", `a:acc:${g.accountRow}`), button("Tenant", `a:t:${g.tenantRow}`)], [back(`a:ag:${g.accountRow}:0`, "Back to groups")]]);
+  }
+
+  async function directory(ctx: Context, requested = 0): Promise<unknown> {
+    const total = n(db, "SELECT COUNT(*) AS n FROM groupDirectory");
+    const page = Math.min(Math.max(0, requested), Math.max(0, Math.ceil(total / pageSize) - 1));
+    const rows = db.prepare("SELECT chatId,title,username,inviteCipher,firstSeenAt,lastSeenAt FROM groupDirectory ORDER BY lastSeenAt DESC,chatId LIMIT ? OFFSET ?")
+      .all(pageSize, page * pageSize) as DirectoryGroup[];
+    const buttons: Button[][] = rows.map((g) => [button(`${short(g.title, 30)}${g.username ? ` · @${short(g.username, 17)}` : ""}`, `a:dg:${g.chatId}:${page}`)]);
+    buttons.push([button("Export .txt", "a:exportgroups", "primary"), button("Refresh links", "a:refreshgroups")]);
+    buttons.push([...(page ? [button("Previous", `a:directory:${page - 1}`, undefined, "prev")] : []), ...(page < Math.ceil(total / pageSize) - 1 ? [button("Next", `a:directory:${page + 1}`, undefined, "next")] : [])]);
+    buttons.push(nav());
+    return render(ctx, `<h2>All groups</h2><p>${total} unique groups ever recorded. Public usernames and available private invite links can be opened. An older private link may have expired or been revoked.</p>`, buttons);
+  }
+
+  async function refreshMissingGroupLinks(): Promise<void> {
+    if (!config.telegramApiId || !config.telegramApiHash || !config.sessionEncryptionKey) return;
+    const sources = db.prepare(`SELECT DISTINCT a.tenantId,a.accountId FROM groups g
+      JOIN accounts a ON a.tenantId=g.tenantId AND a.accountId=g.accountId
+      JOIN groupDirectory d ON d.chatId=g.chatId
+      WHERE g.chatKind='group' AND d.username IS NULL AND d.inviteCipher IS NULL
+        AND a.status='active' AND a.session IS NOT NULL AND a.telegramUserId IS NOT NULL`)
+      .all() as Array<{ tenantId: string; accountId: string }>;
+    for (let offset = 0; offset < sources.length; offset += 3) {
+      await Promise.allSettled(sources.slice(offset, offset + 3).map(async (source) => {
+        const dialogs = await adapterFor(db, source.tenantId, source.accountId).dialogs();
+        const known = new Set((db.prepare("SELECT chatId FROM groups WHERE tenantId=? AND accountId=? AND chatKind='group'").all(source.tenantId, source.accountId) as Array<{ chatId: string }>).map((g) => g.chatId));
+        const update = db.prepare("UPDATE groupDirectory SET title=?,username=COALESCE(?,username),inviteCipher=COALESCE(?,inviteCipher),lastSeenAt=? WHERE chatId=?");
+        db.transaction(() => {
+          for (const g of dialogs) {
+            if (g.kind !== "group" || !known.has(g.chatId)) continue;
+            update.run(g.title, g.username, g.inviteLink ? seal(g.inviteLink, config.sessionEncryptionKey) : null, now(), g.chatId);
+          }
+        })();
+      }));
+    }
+  }
+
+  async function directoryGroup(ctx: Context, chatId: string, page = 0): Promise<unknown> {
+    const g = db.prepare("SELECT chatId,title,username,inviteCipher,firstSeenAt,lastSeenAt FROM groupDirectory WHERE chatId=?").get(chatId) as DirectoryGroup | undefined;
+    if (!g) return directory(ctx, page);
+    const current = n(db, "SELECT COUNT(*) AS n FROM groups WHERE chatId=? AND chatKind='group'", chatId);
+    const enabled = n(db, "SELECT COUNT(*) AS n FROM groups WHERE chatId=? AND chatKind='group' AND enabled=1", chatId);
+    const campaigns = n(db, "SELECT COUNT(*) AS n FROM campaignTargets WHERE chatId=?", chatId);
+    const accounts = db.prepare("SELECT a.rowid AS rowId,COALESCE(a.displayName,a.username,a.phone,'Userbot') AS name FROM groups g JOIN accounts a ON a.tenantId=g.tenantId AND a.accountId=g.accountId WHERE g.chatId=? AND g.chatKind='group' ORDER BY g.updatedAt DESC LIMIT 3")
+      .all(chatId) as Array<{ rowId: number; name: string }>;
+    const link = groupLink(g);
+    return render(ctx, `<h2>${e(g.title)}</h2><p>Username: ${g.username ? `@${e(g.username)}` : "none"}<br/>Chat ID: ${e(g.chatId)}<br/>First recorded: ${e(date(g.firstSeenAt))}<br/>Last recorded: ${e(date(g.lastSeenAt))}<br/>Current userbots: ${current}<br/>Enabled userbots: ${enabled}<br/>Current campaign selections: ${campaigns}<br/>Link: ${link ? "available" : "no public or accessible invite link"}</p>`, [
+      ...(link ? [[{ text: "Open group in Telegram", url: link }]] : []),
+      ...accounts.map((a) => [button(`Userbot · ${short(a.name, 30)}`, `a:acc:${a.rowId}`)]),
+      [back(`a:directory:${page}`, "Back to all groups")],
+    ]);
+  }
+
+  async function exportGroups(ctx: Context): Promise<void> {
+    const missing = n(db, "SELECT COUNT(*) AS n FROM groupDirectory WHERE username IS NULL AND inviteCipher IS NULL");
+    if (missing) await ctx.reply(`Checking connected userbots for links to ${missing} groups. I’ll send the text file when it is ready.`);
+    await refreshMissingGroupLinks();
+    const groups = db.prepare("SELECT chatId,title,username,inviteCipher,firstSeenAt,lastSeenAt FROM groupDirectory ORDER BY title COLLATE NOCASE,chatId").all() as DirectoryGroup[];
+    const lines = ["IOAds groups", `Exported: ${now()}`, `Unique groups: ${groups.length}`, "", ...groups.flatMap((g, index) => [
+      `${index + 1}. ${g.title.replace(/[\r\n]+/g, " ")}`,
+      `Username: ${g.username ? `@${g.username}` : "none"}`,
+      `Chat ID: ${g.chatId}`,
+      `Link: ${groupLink(g) ?? "unavailable (private group; no accessible invite link)"}`,
+      `First recorded: ${g.firstSeenAt}`,
+      `Last recorded: ${g.lastSeenAt}`,
+      "",
+    ])];
+    await ctx.api.sendDocument(config.adminTelegramId, new InputFile(Buffer.from(lines.join("\n"), "utf8"), `ioads-groups-${now().slice(0, 10)}.txt`), { caption: `${groups.length} unique groups recorded by IOAds.` });
+    logAdmin(db, "group_directory_exported", undefined, { groups: groups.length });
   }
 
   async function campaigns(ctx: Context, requested = 0, rowId?: number): Promise<unknown> {
@@ -335,6 +432,10 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
     if ((m = data.match(/^a:tg:(\d+):(\d+)$/))) return groups(ctx, Number(m[2]), Number(m[1]));
     if ((m = data.match(/^a:ag:(\d+):(\d+)$/))) return groups(ctx, Number(m[2]), undefined, Number(m[1]));
     if ((m = data.match(/^a:g:(\d+)$/))) return showGroup(ctx, Number(m[1]));
+    if ((m = data.match(/^a:directory:(\d+)$/))) return directory(ctx, Number(m[1]));
+    if ((m = data.match(/^a:dg:(-?\d+):(\d+)$/))) return directoryGroup(ctx, m[1], Number(m[2]));
+    if (data === "a:exportgroups") return exportGroups(ctx);
+    if (data === "a:refreshgroups") { await refreshMissingGroupLinks(); return directory(ctx); }
     if ((m = data.match(/^a:campaigns:(\d+)$/))) return campaigns(ctx, Number(m[1]));
     if ((m = data.match(/^a:tc:(\d+):(\d+)$/))) return campaigns(ctx, Number(m[2]), Number(m[1]));
     if ((m = data.match(/^a:c:(\d+)$/))) return showCampaign(ctx, Number(m[1]));
@@ -453,7 +554,7 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
 
   bot.use(async (ctx, next) => {
     const data = ctx.callbackQuery && "data" in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
-    const isAdminAction = data?.startsWith("a:") || ctx.message?.text?.match(/^\/(?:admin|cancel)(?:@\w+)?(?:\s|$)/i);
+    const isAdminAction = data?.startsWith("a:") || ctx.message?.text?.match(/^\/(?:admin|groups|cancel)(?:@\w+)?(?:\s|$)/i);
     if (isAdminAction && !requireAdmin(ctx)) {
       if (ctx.callbackQuery) await ctx.answerCallbackQuery({ text: "Admin controls are private.", show_alert: true });
       else if (ctx.chat?.type === "private") await ctx.reply("Admin controls are unavailable.");
@@ -462,6 +563,11 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
     if (!requireAdmin(ctx)) return next();
     try {
       if (ctx.message?.text?.match(/^\/admin(?:@\w+)?(?:\s|$)/i)) return void await dashboard(ctx);
+      if (ctx.message?.text?.match(/^\/groups(?:@\w+)?(?:\s|$)/i)) {
+        setFlow(null);
+        await exportGroups(ctx);
+        return;
+      }
       if (ctx.message?.text?.match(/^\/cancel(?:@\w+)?(?:\s|$)/i) && flow()) { setFlow(null); return void await dashboard(ctx); }
       if (data?.startsWith("a:")) { setFlow(null); return void await handleCallback(ctx, data); }
       const current = flow();
@@ -487,6 +593,7 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
 
   void bot.api.setMyCommands([
     { command: "admin", description: "Open IOAds admin" },
+    { command: "groups", description: "Export all group links as a text file" },
     { command: "menu", description: "Public menu" },
     { command: "cancel", description: "Cancel admin input" },
   ], { scope: { type: "chat", chat_id: config.adminTelegramId } }).catch((error) => console.error(`ads admin commands failed: ${String(error)}`));

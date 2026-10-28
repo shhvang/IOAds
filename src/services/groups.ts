@@ -4,6 +4,8 @@ import { adapterFor, refreshAccountProfile, requireAccount } from "./account.js"
 import { writeAudit } from "./audit.js";
 import { limitFor } from "./limits.js";
 import { randomUUID } from "node:crypto";
+import { config } from "../config.js";
+import { seal } from "../lib/crypto.js";
 
 export async function syncGroups(db: Database.Database, tenantId: string, accountId: string): Promise<unknown[]> {
   requireAccount(db, tenantId, accountId, true);
@@ -13,7 +15,12 @@ export async function syncGroups(db: Database.Database, tenantId: string, accoun
   const insert = db.prepare(`INSERT INTO groups (tenantId, accountId, chatId, title, username, chatKind, lastSeenSync, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(tenantId, accountId, chatId) DO UPDATE SET title=excluded.title, username=excluded.username, chatKind=excluded.chatKind, lastSeenSync=excluded.lastSeenSync, enabled=CASE WHEN excluded.chatKind='group' THEN groups.enabled ELSE 0 END, updatedAt=excluded.updatedAt`);
   const transaction = db.transaction(() => {
-    for (const group of groups) insert.run(tenantId, accountId, group.chatId, group.title, group.username, group.kind, marker, now(), now());
+    for (const group of groups) {
+      insert.run(tenantId, accountId, group.chatId, group.title, group.username, group.kind, marker, now(), now());
+      if (group.kind === "group" && group.inviteLink && config.sessionEncryptionKey)
+        db.prepare("UPDATE groupDirectory SET inviteCipher=? WHERE chatId=?")
+          .run(seal(group.inviteLink, config.sessionEncryptionKey), group.chatId);
+    }
     db.prepare("UPDATE groups SET enabled = 0, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND (lastSeenSync IS NULL OR lastSeenSync != ?)")
       .run(now(), tenantId, accountId, marker);
     db.prepare(`UPDATE campaignTargets SET enabled=0,updatedAt=? WHERE tenantId=? AND accountId=? AND chatId IN

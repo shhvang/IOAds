@@ -86,6 +86,18 @@ The admin screens show fleet health, sender workers, tenants, bot users,
 accounts, enabled groups, campaigns, delivery failures, broadcast progress,
 and audit history. People can be chosen from paged lists, searched by name or
 username, or selected by forwarding one of their messages to the user search.
+Use **/groups** in the admin's private chat for a text file of every unique
+group the service still knows about. **Admin → All groups** browses the same
+directory, including groups whose userbot or tenant was later removed. Each
+group shows its last known username, Telegram ID, current userbots, and
+campaign selections. The export checks connected userbots for missing links
+before sending the file; the browse screen also has **Refresh links**. A public username opens directly; a private group opens
+through an existing invite link only when a connected account could read one.
+Private invite links are stored encrypted. A private group without an available
+invite link remains listed by name and ID. Groups deleted before this directory
+was introduced can only be recovered if a surviving group or broadcast record
+still identifies them. User and userbot details have direct Telegram buttons;
+links without usernames depend on Telegram's privacy settings.
 The admin can grant Pro or Business for 30, 90, or 365 days, extending from
 the current paid expiry, and can revoke a grant. These grants apply only to
 standalone bot users; the rental hub remains authoritative for its tenants'

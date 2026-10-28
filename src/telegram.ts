@@ -12,14 +12,15 @@ export interface TelegramDialog {
   chatId: string;
   title: string;
   username: string | null;
+  inviteLink?: string | null;
   kind: "group" | "channel";
 }
 
 export interface TelegramAdapter {
   sendCode(phone: string): Promise<{ phoneCodeHash: string }>;
-  signIn(phone: string, phoneCodeHash: string, code: string, password?: string): Promise<{ session: string; userId: number; displayName: string }>;
-  resumeSession(): Promise<{ userId: number; displayName: string } | null>;
-  profile(): Promise<{ userId: number; displayName: string }>;
+  signIn(phone: string, phoneCodeHash: string, code: string, password?: string): Promise<{ session: string; userId: number; displayName: string; username?: string | null }>;
+  resumeSession(): Promise<{ userId: number; displayName: string; username?: string | null } | null>;
+  profile(): Promise<{ userId: number; displayName: string; username?: string | null }>;
   dialogs(): Promise<TelegramDialog[]>;
   canPost(chatId: string): Promise<boolean>;
   sendMessage(chatId: string, message: string, entities?: Array<Record<string, unknown>>): Promise<void>;
@@ -73,6 +74,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
   let client: Client | null = null;
   let userId = 0;
   let displayName = "";
+  let username: string | null = null;
   let userPremium = false;
   let authReadyDone = false;
   let previouslyAuthorized = false;
@@ -161,7 +163,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       if (state._ === "authorizationStateReady") {
         setPhase("ready");
         previouslyAuthorized = true;
-        void td.invoke({ _: "getMe" }).then((me) => { userId = me.id; displayName = [me.first_name, me.last_name].filter(Boolean).join(" ").trim(); userPremium = me.is_premium; authReadyDone = true; authReadyResolve(); }).catch(authReadyReject);
+        void td.invoke({ _: "getMe" }).then((me) => { userId = me.id; displayName = [me.first_name, me.last_name].filter(Boolean).join(" ").trim(); username = me.usernames?.active_usernames[0] ?? null; userPremium = me.is_premium; authReadyDone = true; authReadyResolve(); }).catch(authReadyReject);
       }
     }
   });
@@ -179,15 +181,16 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       await Promise.race([firstAuth, new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error("Telegram session check timed out")), 15_000))]);
       if (authPhase !== "ready") return null;
       await Promise.race([ready(), new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error("Telegram session check timed out")), 15_000))]);
-      return { userId, displayName };
+      return { userId, displayName, username };
     },
     async profile() {
       const current = await ready();
       const me = await current.invoke({ _: "getMe" });
       userId = me.id;
       displayName = [me.first_name, me.last_name].filter(Boolean).join(" ").trim();
+      username = me.usernames?.active_usernames[0] ?? null;
       userPremium = me.is_premium;
-      return { userId, displayName };
+      return { userId, displayName, username };
     },
     async sendCode(phone) {
       await waitForPhase("phone", "closed");
@@ -218,7 +221,7 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       } else throw new Error("Telegram is not waiting for a login code");
       if (currentPhase() === "closed") throw new Error("Telegram closed the login session");
       await ready();
-      return { session: `tdlib:${accountId}`, userId, displayName };
+      return { session: `tdlib:${accountId}`, userId, displayName, username };
     },
     async dialogs() {
       const current = await ready();
@@ -238,10 +241,24 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
       const all = [...ids];
       for (let offset = 0; offset < all.length; offset += 25) {
         const batch = await Promise.all(all.slice(offset, offset + 25).map((id) => current.invoke({ _: "getChat", chat_id: id }) as Promise<TdChat>));
-        for (const chat of batch) {
-          if (chat.type._ !== "chatTypeBasicGroup" && chat.type._ !== "chatTypeSupergroup") continue;
-          result.push({ chatId: String(chat.id), title: chat.title, username: null, kind: chat.type._ === "chatTypeSupergroup" && chat.type.is_channel ? "channel" : "group" });
-        }
+        const dialogs = await Promise.all(batch.map(async (chat): Promise<TelegramDialog | null> => {
+          if (chat.type._ !== "chatTypeBasicGroup" && chat.type._ !== "chatTypeSupergroup") return null;
+          const group = chat.type._ === "chatTypeSupergroup"
+            ? await current.invoke({ _: "getSupergroup", supergroup_id: chat.type.supergroup_id }).catch(() => null) : null;
+          const groupUsername = group?.usernames?.active_usernames[0] ?? null;
+          let inviteLink: string | null = null;
+          if (!groupUsername && !(chat.type._ === "chatTypeSupergroup" && chat.type.is_channel)) {
+            try {
+              const info = chat.type._ === "chatTypeSupergroup"
+                ? await current.invoke({ _: "getSupergroupFullInfo", supergroup_id: chat.type.supergroup_id })
+                : await current.invoke({ _: "getBasicGroupFullInfo", basic_group_id: chat.type.basic_group_id });
+              if (info.invite_link && !info.invite_link.is_revoked && (!info.invite_link.expiration_date || info.invite_link.expiration_date > Date.now() / 1000))
+                inviteLink = info.invite_link.invite_link;
+            } catch { /* A member may not have permission to view an invite link. */ }
+          }
+          return { chatId: String(chat.id), title: chat.title, username: groupUsername, inviteLink, kind: chat.type._ === "chatTypeSupergroup" && chat.type.is_channel ? "channel" : "group" };
+        }));
+        result.push(...dialogs.filter((dialog): dialog is TelegramDialog => dialog !== null));
       }
       return result;
     },

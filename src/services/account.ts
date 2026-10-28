@@ -95,8 +95,8 @@ export async function refreshAccountProfile(db: Database.Database, tenantId: str
     db.prepare("UPDATE accounts SET status='logged_out',updatedAt=? WHERE tenantId=? AND accountId=?").run(now(), tenantId, accountId);
     throw new Error("Saved session belongs to another Telegram account. Reconnect to continue.");
   }
-  db.prepare("UPDATE accounts SET displayName=?,telegramUserId=?,updatedAt=? WHERE tenantId=? AND accountId=?")
-    .run(result.displayName || null, result.userId, now(), tenantId, accountId);
+  db.prepare("UPDATE accounts SET displayName=?,username=?,telegramUserId=?,updatedAt=? WHERE tenantId=? AND accountId=?")
+    .run(result.displayName || null, result.username ?? null, result.userId, now(), tenantId, accountId);
 }
 
 export async function loginStart(db: Database.Database, tenantId: string, phone: string, requestedAccountId?: string): Promise<{ accountId: string; sent: true }> {
@@ -171,8 +171,8 @@ export async function loginComplete(db: Database.Database, tenantId: string, acc
     db.prepare("DELETE FROM accounts WHERE tenantId=? AND accountId=? AND phone IS NULL AND session IS NULL AND status='logged_out'").run(tenantId, accountId);
     throw new Error(`This Telegram account is already connected${duplicate.phone ? ` as ${duplicate.phone}` : ""}.`);
   }
-  const saved = db.prepare("UPDATE accounts SET phone = ?, displayName=?, telegramUserId = ?, session = ?, sessionType='tdlib', status = 'active', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'")
-    .run(phone, result.displayName || null, result.userId, seal(result.session, config.sessionEncryptionKey), now(), tenantId, accountId);
+  const saved = db.prepare("UPDATE accounts SET phone = ?, displayName=?, username=?, telegramUserId = ?, session = ?, sessionType='tdlib', status = 'active', loginPhone = NULL, phoneCodeHash = NULL, updatedAt = ? WHERE tenantId = ? AND accountId = ? AND status = 'connecting'")
+    .run(phone, result.displayName || null, result.username ?? null, result.userId, seal(result.session, config.sessionEncryptionKey), now(), tenantId, accountId);
   if (!saved.changes) {
     await adapter.logout().catch(() => undefined);
     adapters.delete(key(tenantId, accountId));
@@ -221,8 +221,8 @@ export async function restoreAccount(db: Database.Database, tenantId: string, ac
     const duplicate = db.prepare("SELECT 1 FROM accounts WHERE tenantId=? AND accountId!=? AND telegramUserId=? AND status IN ('active','limit_paused')")
       .get(tenantId, accountId, resumed.userId);
     if (duplicate) throw new Error("This Telegram account is already connected elsewhere in your account list.");
-    db.prepare("UPDATE accounts SET session=?,sessionType='tdlib',telegramUserId=?,displayName=?,status='active',updatedAt=? WHERE tenantId=? AND accountId=? AND status='logged_out'")
-      .run(seal(`tdlib:${accountId}`, config.sessionEncryptionKey), resumed.userId, resumed.displayName || null, now(), tenantId, accountId);
+    db.prepare("UPDATE accounts SET session=?,sessionType='tdlib',telegramUserId=?,displayName=?,username=?,status='active',updatedAt=? WHERE tenantId=? AND accountId=? AND status='logged_out'")
+      .run(seal(`tdlib:${accountId}`, config.sessionEncryptionKey), resumed.userId, resumed.displayName || null, resumed.username ?? null, now(), tenantId, accountId);
     return true;
   } catch (error) {
     await adapter.close().catch(() => undefined);

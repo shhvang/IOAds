@@ -5,7 +5,9 @@ import { tierLimits } from "./services/plans.js";
 import { broadcastAudienceCounts, createAdminBroadcast, grantStandalonePlan, runAdminBroadcastOnce, setAdminBroadcastStatus, setUserBlocked, startAdminBroadcast } from "./services/admin.js";
 import { FakeTelegramAdapter } from "./telegram.js";
 import { runSchedulerOnce } from "./services/scheduler.js";
-import { activeAccount, adapterFor } from "./services/account.js";
+import { activeAccount, adapterFor, setAdapterForTest, forgetAdapter } from "./services/account.js";
+import { syncGroups } from "./services/groups.js";
+import { groupLink, telegramProfileLink } from "./admin-bot.js";
 import { isTenantBlocked } from "./services/limits.js";
 import { inlineResults } from "./inline.js";
 
@@ -26,6 +28,36 @@ function seed(owner: number, tier: string, groups: string[]): void {
 }
 seed(10, "free", ["-100", "-101"]);
 seed(20, "pro", ["-100", "-102"]);
+assert.equal((db.prepare("SELECT COUNT(*) AS n FROM groupDirectory").get() as { n: number }).n, 3);
+assert.equal(telegramProfileLink("ad_user", 42), "https://t.me/ad_user");
+assert.equal(telegramProfileLink(null, 42), "tg://user?id=42");
+assert.equal(telegramProfileLink(null, 42, "+12345678901"), "https://t.me/+12345678901");
+const previousKey = config.sessionEncryptionKey;
+config.sessionEncryptionKey = "directory-test-key";
+seed(30, "free", []);
+const directoryAdapter = new FakeTelegramAdapter();
+directoryAdapter.profile = async () => ({ userId: 1030, displayName: "Sender", username: "sender_user" });
+directoryAdapter.groups.push(
+  { chatId: "-100300", title: "Public group", username: "public_group", kind: "group" },
+  { chatId: "-100301", title: "Private group", username: null, inviteLink: "https://t.me/+inviteHash123", kind: "group" },
+  { chatId: "-100302", title: "Channel", username: "some_channel", kind: "channel" },
+);
+setAdapterForTest("ads:30", "account-30", directoryAdapter);
+await syncGroups(db, "ads:30", "account-30");
+assert.equal((db.prepare("SELECT username FROM accounts WHERE accountId='account-30'").get() as { username: string }).username, "sender_user");
+const publicGroup = db.prepare("SELECT username,inviteCipher FROM groupDirectory WHERE chatId='-100300'").get() as { username: string | null; inviteCipher: string | null };
+const privateGroup = db.prepare("SELECT username,inviteCipher FROM groupDirectory WHERE chatId='-100301'").get() as { username: string | null; inviteCipher: string | null };
+assert.equal(groupLink(publicGroup), "https://t.me/public_group");
+assert.ok(privateGroup.inviteCipher && !privateGroup.inviteCipher.includes("inviteHash123"));
+assert.equal(groupLink(privateGroup), "https://t.me/+inviteHash123");
+assert.equal(db.prepare("SELECT 1 FROM groupDirectory WHERE chatId='-100302'").get(), undefined);
+db.prepare("DELETE FROM accounts WHERE accountId='account-30'").run();
+assert.equal(db.prepare("SELECT 1 FROM groups WHERE chatId='-100301'").get(), undefined);
+assert.equal(groupLink(db.prepare("SELECT username,inviteCipher FROM groupDirectory WHERE chatId='-100301'").get() as typeof privateGroup), "https://t.me/+inviteHash123");
+db.prepare("DELETE FROM localUsers WHERE telegramId=30").run();
+db.prepare("DELETE FROM tenants WHERE tenantId='ads:30'").run();
+forgetAdapter("ads:30", "account-30");
+config.sessionEncryptionKey = previousKey;
 assert.deepEqual(broadcastAudienceCounts(db, 1), { botUsers: 2, groups: 0 });
 assert.deepEqual(broadcastAudienceCounts(db, 2), { botUsers: 2, groups: 2 });
 assert.deepEqual(broadcastAudienceCounts(db, 3), { botUsers: 2, groups: 3 });

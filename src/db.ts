@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS groups (
   createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, PRIMARY KEY (tenantId, accountId, chatId),
   FOREIGN KEY (tenantId, accountId) REFERENCES accounts(tenantId, accountId) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS groupDirectory (
+  chatId TEXT PRIMARY KEY, title TEXT NOT NULL, username TEXT, inviteCipher TEXT,
+  firstSeenAt TEXT NOT NULL, lastSeenAt TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS campaigns (
   id INTEGER PRIMARY KEY AUTOINCREMENT, tenantId TEXT NOT NULL, name TEXT NOT NULL,
   senderAccountId TEXT NOT NULL,
@@ -123,9 +127,26 @@ export function openDb(path: string): Database.Database {
   const accountColumns = db.prepare("PRAGMA table_info(accounts)").all() as Array<{ name: string }>;
   if (!accountColumns.some((column) => column.name === "sendAfter")) db.exec("ALTER TABLE accounts ADD COLUMN sendAfter TEXT");
   if (!accountColumns.some((column) => column.name === "displayName")) db.exec("ALTER TABLE accounts ADD COLUMN displayName TEXT");
+  if (!accountColumns.some((column) => column.name === "username")) db.exec("ALTER TABLE accounts ADD COLUMN username TEXT");
   const groupColumns = db.prepare("PRAGMA table_info(groups)").all() as Array<{ name: string }>;
   if (!groupColumns.some((column) => column.name === "lastSeenSync")) db.exec("ALTER TABLE groups ADD COLUMN lastSeenSync TEXT");
   if (!groupColumns.some((column) => column.name === "chatKind")) db.exec("ALTER TABLE groups ADD COLUMN chatKind TEXT NOT NULL DEFAULT 'unknown'");
+  db.exec(`INSERT OR IGNORE INTO groupDirectory(chatId,title,username,firstSeenAt,lastSeenAt)
+    SELECT chatId,title,username,createdAt,updatedAt FROM groups WHERE chatKind IN ('group','unknown') ORDER BY updatedAt DESC;
+    INSERT OR IGNORE INTO groupDirectory(chatId,title,username,firstSeenAt,lastSeenAt)
+    SELECT q.chatId,'Group ' || q.chatId,NULL,MIN(b.createdAt),MAX(b.createdAt)
+      FROM adminBroadcastTargets q JOIN adminBroadcasts b ON b.id=q.broadcastId
+      WHERE q.kind='userbot' GROUP BY q.chatId;
+    UPDATE groupDirectory SET firstSeenAt=MIN(firstSeenAt,(SELECT MIN(g.createdAt) FROM groups g WHERE g.chatId=groupDirectory.chatId))
+      WHERE EXISTS(SELECT 1 FROM groups g WHERE g.chatId=groupDirectory.chatId AND g.chatKind IN ('group','unknown'));
+    CREATE TRIGGER IF NOT EXISTS group_directory_insert AFTER INSERT ON groups WHEN NEW.chatKind='group' BEGIN
+      INSERT INTO groupDirectory(chatId,title,username,firstSeenAt,lastSeenAt) VALUES(NEW.chatId,NEW.title,NEW.username,NEW.createdAt,NEW.updatedAt)
+      ON CONFLICT(chatId) DO UPDATE SET title=excluded.title,username=excluded.username,lastSeenAt=excluded.lastSeenAt;
+    END;
+    CREATE TRIGGER IF NOT EXISTS group_directory_sync AFTER UPDATE OF title,username,chatKind,lastSeenSync ON groups WHEN NEW.chatKind='group' BEGIN
+      INSERT INTO groupDirectory(chatId,title,username,firstSeenAt,lastSeenAt) VALUES(NEW.chatId,NEW.title,NEW.username,NEW.createdAt,NEW.updatedAt)
+      ON CONFLICT(chatId) DO UPDATE SET title=excluded.title,username=excluded.username,lastSeenAt=excluded.lastSeenAt;
+    END;`);
   if (!accountColumns.some((column) => column.name === "sessionType")) {
     db.exec("ALTER TABLE accounts ADD COLUMN sessionType TEXT NOT NULL DEFAULT 'gramjs'");
   }
