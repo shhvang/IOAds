@@ -52,7 +52,7 @@ Albums are refused because Telegram delivers their items separately. The
 archive must be separate from every campaign target. Without an archive,
 Free posts that cannot be sent inline are refused at creation. Paid posts that
 need a direct archive copy are refused until `ADS_ARCHIVE_CHAT` is configured.
-The standalone plans allow 2,000 daily messages on Free, 5,000 on Pro ($1),
+The standalone and rental plans share the same prices and limits. They allow 2,000 daily messages on Free, 5,000 on Pro ($1),
 and 15,000 on Business ($3), with 1, 5, and 15 connected account slots and
 1, 5, and 20 campaign slots respectively. A
 connected sender must be a different Telegram account from the one operating

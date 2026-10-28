@@ -8,7 +8,7 @@ import { now } from "./db.js";
 import { accounts, canRestoreAccount, cancelLogin, deleteAccount, loginComplete, loginStart, logout, refreshAccountProfile, restoreAccount } from "./services/account.js";
 import { addTarget, clearTargets, deleteCampaign, listCampaigns, saveCampaignPost, selectAllTargets, setCampaignStatus, updateTarget } from "./services/campaigns.js";
 import { syncGroups, setGroup } from "./services/groups.js";
-import { standaloneInlineMode, standalonePostingIssue, tierLimits } from "./services/plans.js";
+import { PLAN_PRICES, standaloneInlineMode, standalonePostingIssue, tierLimits } from "./services/plans.js";
 import { enforceTenantLimits } from "./services/limits.js";
 import { paymentMethods, verifyPayment, type PaymentMethod } from "./payments.js";
 import { back, button, editRich, editRichAt, escapeHtml, menu, replyRich, type Button } from "./bot-ui.js";
@@ -634,13 +634,13 @@ export function startAdsBot(db: Database.Database): void {
     await ctx.answerCallbackQuery();
     const row = db.prepare("SELECT tierCode FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { tierCode: string };
     const expires = db.prepare("SELECT paidUntil FROM localUsers WHERE telegramId = ?").get(ctx.from.id) as { paidUntil: string | null };
-    const rows = [[button("Choose Pro · $1/mo", "upgrade:pro", "primary", "card")], [button("Choose Business · $3/mo", "upgrade:business", undefined, "card")], [back("home", "Back to home")]];
+    const rows = [[button(`Choose Pro · $${PLAN_PRICES.pro}/mo`, "upgrade:pro", "primary", "card")], [button(`Choose Business · $${PLAN_PRICES.business}/mo`, "upgrade:business", undefined, "card")], [back("home", "Back to home")]];
     await editRich(ctx, `<h2>Your plan · ${escapeHtml(row.tierCode)}</h2><p>${expires.paidUntil ? `Active until ${new Date(expires.paidUntil).toLocaleDateString()}.` : "Choose a plan when you need more accounts, campaigns, or daily sends."}</p><table compact><tr><th>Plan</th><th>Accounts</th><th>Campaigns</th><th>Daily sends</th></tr>${([['Free', 'free'], ['Pro', 'pro'], ['Business', 'business']] as const).map(([label, tier]) => `<tr><td>${label}</td><td>${tierLimits(tier).accounts}</td><td>${tierLimits(tier).campaigns}</td><td>${tierLimits(tier).dailyMessages.toLocaleString()}</td></tr>`).join("")}</table><p>Payments are checked automatically after you send a transaction ID.</p>`, { parse_mode: "HTML", reply_markup: menu(rows) });
   });
   bot.callbackQuery(/^upgrade:(pro|business)$/, async (ctx) => {
     flows.delete(ctx.from.id);
     const tier = ctx.match[1]!;
-    const monthly = tier === "pro" ? 1 : 3;
+    const monthly = PLAN_PRICES[tier as "pro" | "business"];
     const date = new Date(Date.now() + 30 * 86400_000).toISOString();
     const available = paymentMethods();
     if (!available.length) return ctx.answerCallbackQuery({ text: "Payments aren’t configured yet. Ask the bot owner.", show_alert: true });
@@ -652,7 +652,7 @@ export function startAdsBot(db: Database.Database): void {
   });
   bot.callbackQuery(/^pay:(pro|business):(Binance|BEP20|TRC20)$/, async (ctx) => {
     const tier = ctx.match[1]!, method = ctx.match[2] as PaymentMethod;
-    const amount = tier === "pro" ? 1 : 3;
+    const amount = PLAN_PRICES[tier as "pro" | "business"];
     if (!paymentMethods().includes(method)) return ctx.answerCallbackQuery({ text: "Payment method unavailable", show_alert: true });
     const address = method === "Binance" ? `Binance Pay UID: ${config.paymentBinancePayId}` : method === "BEP20" ? config.paymentBep20Address : config.paymentTrc20Address;
     const reference = `ads:${ctx.from.id}:${Date.now()}`;

@@ -1,4 +1,5 @@
 export const PLAN_RANKS: Record<string, number> = { free: 0, starter: 0, pro: 1, business: 2 };
+export const PLAN_PRICES: Record<"free" | "pro" | "business", number> = { free: 0, pro: 1, business: 3 };
 export const tierRank = (tier: string): number => PLAN_RANKS[tier] ?? 0;
 export const standaloneInlineMode = (tier: string): boolean => tierRank(tier) === 0;
 

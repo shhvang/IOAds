@@ -80,7 +80,7 @@ export function setCampaignStatus(db: Database.Database, tenantId: string, id: n
   if (!current) throw new Error("campaign not found");
   if (status === "scheduled") {
     const tenant = db.prepare("SELECT productId,tierCode FROM tenants WHERE tenantId=?").get(tenantId) as { productId: string; tierCode: string };
-    if (tenant.productId === "ads-standalone") {
+    if (tenant.productId === "ads-standalone" || tenant.tierCode === "free") {
       const issue = standalonePostingIssue(tenant.tierCode, current, config.botUsername);
       if (issue) throw new Error(issue);
     }

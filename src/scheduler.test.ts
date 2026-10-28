@@ -6,6 +6,7 @@ import { addTarget as addCampaignTarget, createCampaign, saveCampaignPost, setCa
 import { runSchedulerOnce } from "./services/scheduler.js";
 import { tierLimits } from "./services/plans.js";
 import { enforceTenantLimits } from "./services/limits.js";
+import { inlineResults } from "./inline.js";
 
 config.deliveryConcurrency = 16;
 const db = openDb(":memory:");
@@ -113,6 +114,20 @@ planDb.prepare("UPDATE campaigns SET contentKind='rich',richContent='{}',sourceC
 enforceTenantLimits(planDb, "ads:42");
 assert.equal((planDb.prepare("SELECT status FROM campaigns WHERE id=?").get(planCampaign.id) as { status: string }).status, "paused");
 assert.throws(() => setCampaignStatus(planDb, "ads:42", planCampaign.id, "scheduled"), /archive copy/);
+const rentalDb = openDb(":memory:");
+rentalDb.prepare("INSERT INTO tenants (tenantId,productId,ownerId,state,tierCode,runtime,version,trial,limits,config,updatedAt,appliedAt) VALUES ('rental-free','ads',80,'active','free','service',1,0,?,'{}',?,?)")
+  .run(JSON.stringify(tierLimits("free")), time, time);
+rentalDb.prepare("INSERT INTO accounts (accountId,tenantId,ownerId,telegramUserId,session,status,createdAt,updatedAt) VALUES ('rental-sender','rental-free',80,81,'fake','active',?,?)").run(time, time);
+rentalDb.prepare("INSERT INTO groups (tenantId,accountId,chatId,title,enabled,chatKind,createdAt,updatedAt) VALUES ('rental-free','rental-sender','-8080','Rental group',1,'group',?,?)").run(time, time);
+const rentalCampaign = createCampaign(rentalDb, "rental-free", { name: "Rental Free", message: "A rented post", senderAccountId: "rental-sender", intervalSeconds: 300 }) as { id: number };
+await addCampaignTarget(rentalDb, "rental-free", rentalCampaign.id, "-8080");
+setCampaignStatus(rentalDb, "rental-free", rentalCampaign.id, "scheduled");
+assert.equal(inlineResults(rentalDb, 81, `campaign:${rentalCampaign.id}`, config.botUsername).length, 1);
+const rentalAdapter = new FakeTelegramAdapter();
+assert.equal(await runSchedulerOnce(rentalDb, () => rentalAdapter), 1);
+assert.deepEqual(rentalAdapter.inlineSent, [{ chatId: "-8080", query: `campaign:${rentalCampaign.id}` }]);
+assert.equal(rentalAdapter.sent.length, 0);
+rentalDb.close();
 config.botUsername = previousBotUsername;
 planDb.close();
 console.log("scheduler: complete fanout, cooldown, and retry pass");

@@ -1,20 +1,33 @@
 import { CONTRACT_REVISION, CONTRACT_SHA256, type ProductManifest } from "./contract.js";
 import { config } from "../config.js";
+import { PLAN_LIMITS, PLAN_PRICES } from "../services/plans.js";
+
+const tiers = ([
+  { code: "free", label: "Free", blurb: "One account and one campaign, posted through the bot's inline mode." },
+  { code: "pro", label: "Pro", blurb: "Five accounts and five campaigns, sent directly from your accounts." },
+  { code: "business", label: "Business", blurb: "Fifteen accounts and twenty campaigns for larger schedules." },
+] as const).map(({ code, label, blurb }) => ({
+  code, label, blurb, priceUsd: PLAN_PRICES[code],
+  limits: PLAN_LIMITS[code]!,
+  lines: [
+    `${PLAN_LIMITS[code]!.accounts} account${PLAN_LIMITS[code]!.accounts === 1 ? "" : "s"}`,
+    `${PLAN_LIMITS[code]!.campaigns} campaign${PLAN_LIMITS[code]!.campaigns === 1 ? "" : "s"}`,
+    `${PLAN_LIMITS[code]!.dailyMessages.toLocaleString()} messages/day`,
+    code === "free" ? "Inline posting" : "Direct posting and custom group messages",
+  ],
+  listed: true,
+}));
 
 export const productManifest = (): ProductManifest => ({
   contract: CONTRACT_REVISION,
   contractSha256: CONTRACT_SHA256,
   productId: "ads",
   label: "IOAds",
-  blurb: "Schedule messages to Telegram groups you already manage.",
+  blurb: "Schedule posts to groups your connected Telegram accounts already belong to.",
   singleton: true,
   hubRunnable: false,
-  defaultTier: "starter",
-  tiers: [
-    { code: "starter", label: "Starter", blurb: "Scheduled group campaigns.", limits: { accounts: 1, groups: 10, campaigns: 3, targets: 10, dailyMessages: 100 }, lines: ["1 account", "10 groups", "3 campaigns", "100 messages/day", "Standard messages"], listed: true },
-    { code: "pro", label: "Pro", blurb: "Custom group copy and larger limits.", limits: { accounts: 3, groups: 100, campaigns: 20, targets: 100, dailyMessages: 1000 }, lines: ["3 accounts", "100 groups", "20 campaigns", "1,000 messages/day", "Custom group messages"], listed: true },
-    { code: "business", label: "Business", blurb: "High-volume group campaigns.", limits: { accounts: 10, groups: 500, campaigns: 100, targets: 500, dailyMessages: 5000 }, lines: ["10 accounts", "500 groups", "100 campaigns", "5,000 messages/day", "Custom group messages"], listed: true },
-  ],
+  defaultTier: "free",
+  tiers,
   provisioning: { fields: [{ key: "botToken", kind: "bot_token", label: "Owner control bot token", hint: "Used only to verify Telegram Mini App initData.", required: true, secret: true }] },
   usageKeys: [
     { key: "accounts", label: "Connected accounts", format: "count" },
@@ -22,5 +35,5 @@ export const productManifest = (): ProductManifest => ({
     { key: "dailyMessages", label: "Messages today", format: "count" },
   ],
   entryUrl: config.entryUrl,
-  nextSteps: ["Log in with a Telegram user account", "Sync groups already visible to that account", "Create and schedule a campaign"],
+  nextSteps: ["Connect a separate Telegram user account", "Refresh the groups that account already belongs to", "Send or forward a post, choose targets, and schedule it"],
 });

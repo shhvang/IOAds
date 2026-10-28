@@ -17,7 +17,8 @@ import { createApiRouter } from "./api.js";
 import { bearerToken, secretMatches } from "./rental/contract.js";
 import { storeControlBotToken } from "./rental/secrets.js";
 import { rawAmount } from "./payments.js";
-import { standalonePostingIssue, tierLimits } from "./services/plans.js";
+import { PLAN_PRICES, standalonePostingIssue, tierLimits } from "./services/plans.js";
+import { productManifest } from "./rental/manifest.js";
 import { parseLimits } from "./services/limits.js";
 import { button, editRich, richHtml } from "./bot-ui.js";
 import { cachedInlineMedia } from "./bot.js";
@@ -46,6 +47,8 @@ assert.equal(Number.isNaN(rawAmount("not-a-number", 6)), true);
 assert.deepEqual(["free", "pro", "business"].map((tier) => tierLimits(tier).dailyMessages), [2000, 5000, 15000]);
 assert.deepEqual(["free", "pro", "business"].map((tier) => tierLimits(tier).accounts), [1, 5, 15]);
 assert.deepEqual(["free", "pro", "business"].map((tier) => tierLimits(tier).campaigns), [1, 5, 20]);
+assert.deepEqual(productManifest().tiers.map((tier) => [tier.code, (tier as typeof tier & { priceUsd: number }).priceUsd, tier.limits]),
+  (["free", "pro", "business"] as const).map((tier) => [tier, PLAN_PRICES[tier], tierLimits(tier)]));
 assert.equal(parseLimits({ ...tierLimits("pro"), campaigns: 100 }, "pro", true), null);
 assert.equal(parseLimits({ ...tierLimits("pro"), campaigns: 100 }, "pro")?.campaigns, 100);
 const richWithoutArchive = { message: "[Telegram rich message]", contentKind: "rich", richContent: "{}", richMessage: null, sourceChatId: null, sourceMessageId: null, inlineOptions: "{}" };

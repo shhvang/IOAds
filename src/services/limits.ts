@@ -68,7 +68,7 @@ export function enforceTenantLimits(db: Database.Database, tenantId: string): vo
       (SELECT rowid FROM groups WHERE tenantId = ? AND enabled = 1 AND chatKind='group' ORDER BY rowid LIMIT ?)`).run(tenantId, tenantId, limits.groups);
     db.prepare(`UPDATE campaigns SET status = 'paused', updatedAt = datetime('now') WHERE tenantId = ? AND status IN ('draft', 'scheduled', 'paused') AND id NOT IN
       (SELECT id FROM campaigns WHERE tenantId = ? AND status!='cancelled' ORDER BY id LIMIT ?)`).run(tenantId, tenantId, limits.campaigns);
-    if (tenant.productId === "ads-standalone") {
+    if (tenant.productId === "ads-standalone" || tenant.tierCode === "free") {
       const scheduled = db.prepare("SELECT id,message,contentKind,richContent,richMessage,sourceChatId,sourceMessageId,inlineOptions FROM campaigns WHERE tenantId=? AND status='scheduled'").all(tenantId) as Array<{ id: number; message: string; contentKind: string; richContent: string | null; richMessage: string | null; sourceChatId: string | null; sourceMessageId: number | null; inlineOptions: string | null }>;
       for (const row of scheduled) {
         const issue = standalonePostingIssue(tenant.tierCode, row, config.botUsername);

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 - 2026-10-28
+
+### Changed
+- Publish the standalone Free, Pro, and Business prices and limits in the rental manifest from the same constants the Ads bot uses.
+- Describe Ads as posting to groups connected accounts already belong to, with inline posting on Free and direct posting on paid plans.
+- Route rented Free campaigns through inline posting too, and validate them before scheduling.
+
 ## 0.6.0 - 2026-10-18
 
 ### Added

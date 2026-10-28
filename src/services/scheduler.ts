@@ -93,7 +93,7 @@ async function deliver(db: Database.Database, d: Delivery, getAdapter: (tenantId
       if (issue) throw new Error(issue);
     }
     if (d.messageOverride && tierRank(d.tierCode) >= 1) await getAdapter(d.tenantId, d.accountId).sendMessage(d.chatId, message, []);
-    else if (d.productId === "ads-standalone" ? tierRank(d.tierCode) === 0 : !!d.inlineMode) {
+    else if (d.productId === "ads-standalone" || d.tierCode === "free" ? tierRank(d.tierCode) === 0 : !!d.inlineMode) {
       if (!config.botUsername) throw new Error("Inline delivery needs ADS_BOT_USERNAME.");
       await getAdapter(d.tenantId, d.accountId).sendInline(d.chatId, `campaign:${d.campaignId}`);
     }
