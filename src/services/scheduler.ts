@@ -19,22 +19,30 @@ const nextDay = (): string => {
 };
 
 function planDeliveries(db: Database.Database): void {
-  db.prepare("UPDATE deliveries SET status='skipped',error='account or target unavailable' WHERE status IN ('pending','retry') AND (NOT EXISTS (SELECT 1 FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId WHERE a.tenantId=deliveries.tenantId AND a.accountId=deliveries.accountId AND a.status='active' AND a.session IS NOT NULL AND a.telegramUserId IS NOT NULL AND a.telegramUserId!=t.ownerId) OR NOT EXISTS (SELECT 1 FROM groups g WHERE g.tenantId=deliveries.tenantId AND g.accountId=deliveries.accountId AND g.chatId=deliveries.chatId AND g.enabled=1 AND g.chatKind='group') OR NOT EXISTS (SELECT 1 FROM campaignTargets ct WHERE ct.campaignId=deliveries.campaignId AND ct.accountId=deliveries.accountId AND ct.chatId=deliveries.chatId AND ct.enabled=1))").run();
+  const skipped = db.prepare("UPDATE deliveries SET status='skipped',error='account or target unavailable' WHERE status IN ('pending','retry') AND (NOT EXISTS (SELECT 1 FROM accounts a JOIN tenants t ON t.tenantId=a.tenantId WHERE a.tenantId=deliveries.tenantId AND a.accountId=deliveries.accountId AND a.status='active' AND a.session IS NOT NULL AND a.telegramUserId IS NOT NULL AND a.telegramUserId!=t.ownerId) OR NOT EXISTS (SELECT 1 FROM groups g WHERE g.tenantId=deliveries.tenantId AND g.accountId=deliveries.accountId AND g.chatId=deliveries.chatId AND g.enabled=1 AND g.chatKind='group') OR NOT EXISTS (SELECT 1 FROM campaignTargets ct WHERE ct.campaignId=deliveries.campaignId AND ct.accountId=deliveries.accountId AND ct.chatId=deliveries.chatId AND ct.enabled=1))").run();
+  if (skipped.changes > 0) console.log(`[planner] skipped ${skipped.changes} deliveries (unavailable)`);
   const due = db.prepare("SELECT c.id FROM campaigns c JOIN tenants t ON t.tenantId=c.tenantId LEFT JOIN localUsers u ON u.tenantId=c.tenantId WHERE c.status='scheduled' AND (c.nextRunAt IS NULL OR c.nextRunAt<=?) AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) ORDER BY c.nextRunAt,c.id LIMIT 1000").all(now()) as Array<{ id: number }>;
+  console.log(`[planner] ${due.length} campaigns due`);
   const plan = db.transaction((id: number) => {
     const c = db.prepare("SELECT c.*,t.state,t.runtime,t.suspendReason,u.forceJoined FROM campaigns c JOIN tenants t ON t.tenantId=c.tenantId LEFT JOIN localUsers u ON u.tenantId=c.tenantId WHERE c.id=?").get(id) as Record<string, unknown> | undefined;
-    if (!c || c.status !== "scheduled" || c.state !== "active" || c.runtime !== "service" || c.suspendReason === "blocked" || c.forceJoined === 0) return;
+    if (!c) { console.log(`[planner] campaign ${id}: not found`); return; }
+    if (c.status !== "scheduled") { console.log(`[planner] campaign ${id}: status=${c.status}`); return; }
+    if (c.state !== "active") { console.log(`[planner] campaign ${id}: tenant state=${c.state}`); return; }
+    if (c.runtime !== "service") { console.log(`[planner] campaign ${id}: runtime=${c.runtime}`); return; }
+    if (c.suspendReason === "blocked") { console.log(`[planner] campaign ${id}: suspended`); return; }
+    if (c.forceJoined === 0) { console.log(`[planner] campaign ${id}: forceJoined=0`); return; }
     const time = now();
     if (c.nextRunAt && String(c.nextRunAt) > time) return;
     db.prepare("UPDATE campaigns SET nextRunAt=?,updatedAt=? WHERE id=?").run(new Date(Date.now() + Number(c.intervalSeconds) * 1000).toISOString(), time, id);
     const occurrence = `${id}:${c.nextRunAt ?? time}`;
-    db.prepare(`INSERT OR IGNORE INTO deliveries (tenantId,campaignId,chatId,accountId,occurrenceKey,status,attempts,nextAttemptAt,createdAt)
+    const inserted = db.prepare(`INSERT OR IGNORE INTO deliveries (tenantId,campaignId,chatId,accountId,occurrenceKey,status,attempts,nextAttemptAt,createdAt)
       SELECT ct.tenantId,ct.campaignId,ct.chatId,ct.accountId,? || ':' || ct.accountId || ':' || ct.chatId,'pending',0,?,?
       FROM campaignTargets ct JOIN groups g ON g.tenantId=ct.tenantId AND g.accountId=ct.accountId AND g.chatId=ct.chatId
       JOIN accounts a ON a.tenantId=ct.tenantId AND a.accountId=ct.accountId JOIN tenants t ON t.tenantId=ct.tenantId
       WHERE ct.campaignId=? AND ct.tenantId=? AND ct.enabled=1 AND g.enabled=1 AND g.chatKind='group' AND a.status='active' AND a.session IS NOT NULL AND a.telegramUserId IS NOT NULL AND a.telegramUserId!=t.ownerId
       AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.campaignId=ct.campaignId AND d.accountId=ct.accountId AND d.status IN ('pending','retry','claimed') AND d.occurrenceKey NOT LIKE ? || ':%')`)
       .run(occurrence, time, time, id, c.tenantId, occurrence);
+    console.log(`[planner] campaign ${id}: planned ${inserted.changes} deliveries`);
   });
   for (const row of due) plan(row.id);
 }
@@ -44,15 +52,23 @@ function claimDelivery(db: Database.Database): Delivery | "deferred" | null {
     const time = now();
     const candidate = db.prepare("SELECT d.id,d.tenantId,d.campaignId,c.dailyLimit FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN tenants t ON t.tenantId=d.tenantId JOIN accounts a ON a.tenantId=d.tenantId AND a.accountId=d.accountId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN campaignTargets ct ON ct.campaignId=d.campaignId AND ct.accountId=d.accountId AND ct.chatId=d.chatId LEFT JOIN localUsers u ON u.tenantId=d.tenantId WHERE d.status IN ('pending','retry') AND (d.nextAttemptAt IS NULL OR d.nextAttemptAt<=?) AND c.status='scheduled' AND t.state='active' AND t.runtime='service' AND COALESCE(t.suspendReason,'')!='blocked' AND (u.forceJoined IS NULL OR u.forceJoined=1) AND a.status='active' AND a.session IS NOT NULL AND a.telegramUserId IS NOT NULL AND a.telegramUserId!=t.ownerId AND (a.sendAfter IS NULL OR a.sendAfter<=?) AND g.enabled=1 AND g.chatKind='group' AND ct.enabled=1 AND NOT EXISTS (SELECT 1 FROM deliveries active WHERE active.accountId=d.accountId AND active.status='claimed') AND NOT EXISTS (SELECT 1 FROM adminBroadcastTargets active WHERE active.accountId=d.accountId AND active.status='claimed') AND NOT EXISTS (SELECT 1 FROM adminBroadcastTargets priority JOIN adminBroadcasts b ON b.id=priority.broadcastId WHERE priority.accountId=d.accountId AND priority.status IN ('pending','retry') AND (priority.nextAttemptAt IS NULL OR priority.nextAttemptAt<=?) AND b.status='running') ORDER BY d.nextAttemptAt,d.id LIMIT 1")
       .get(time, time, time) as { id: number; tenantId: string; campaignId: number; dailyLimit: number } | undefined;
-    if (!candidate) return null;
+    if (!candidate) { console.log(`[claimer] no claimable deliveries`); return null; }
     const limits = tenantLimits(db, candidate.tenantId);
     const day = time.slice(0, 10);
     const count = (campaignId?: number): number => (db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE tenantId=? AND (? IS NULL OR campaignId=?) AND ((status='sent' AND sentAt>=?) OR (status='claimed' AND claimedAt>=?))")
       .get(candidate.tenantId, campaignId ?? null, campaignId ?? null, day, day) as { n: number }).n;
-    if (count() >= limits.dailyMessages || (candidate.dailyLimit > 0 && count(candidate.campaignId) >= candidate.dailyLimit)) {
+    const tenantCount = count(), campaignCount = count(candidate.campaignId);
+    if (tenantCount >= limits.dailyMessages) { 
+      console.log(`[claimer] delivery ${candidate.id}: tenant daily limit (${tenantCount}/${limits.dailyMessages})`);
       db.prepare("UPDATE deliveries SET status='retry',nextAttemptAt=? WHERE id=?").run(nextDay(), candidate.id);
       return "deferred";
     }
+    if (candidate.dailyLimit > 0 && campaignCount >= candidate.dailyLimit) {
+      console.log(`[claimer] delivery ${candidate.id}: campaign daily limit (${campaignCount}/${candidate.dailyLimit})`);
+      db.prepare("UPDATE deliveries SET status='retry',nextAttemptAt=? WHERE id=?").run(nextDay(), candidate.id);
+      return "deferred";
+    }
+    console.log(`[claimer] claimed delivery ${candidate.id} (campaign ${candidate.campaignId})`);
     db.prepare("UPDATE deliveries SET status='claimed',attempts=attempts+1,claimedAt=?,error=NULL WHERE id=?").run(time, candidate.id);
     return db.prepare("SELECT d.id,d.tenantId,d.campaignId,d.accountId,d.chatId,d.attempts,c.message,c.messageEntities,c.sourceChatId,c.sourceMessageId,c.inlineMode,c.contentKind,c.richContent,c.richMessage,c.inlineOptions,c.groupCooldownSeconds,c.accountCooldownSeconds,g.messageOverride,g.lastSentAt,t.tierCode,t.productId FROM deliveries d JOIN campaigns c ON c.id=d.campaignId JOIN groups g ON g.tenantId=d.tenantId AND g.accountId=d.accountId AND g.chatId=d.chatId JOIN tenants t ON t.tenantId=d.tenantId WHERE d.id=?")
       .get(candidate.id) as Delivery;
