@@ -175,12 +175,26 @@ export function createTelegramAdapter(accountId: string): TelegramAdapter {
     getEmailCode: () => Promise.reject(new Error("email login is not supported yet")),
   });
   void login.catch((error) => { authError = error; authReadyReject(error); });
-  const ready = async (): Promise<Client> => { await authReady; return td; };
+  const waitForSession = async (promise: Promise<void>): Promise<void> => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([promise, new Promise<void>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Telegram session check timed out")), 15_000);
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
+  };
+  const ready = async (): Promise<Client> => {
+    await waitForSession(firstAuth);
+    if (authPhase !== "ready") throw new Error("Telegram session is not authorized. Reconnect this sender account.");
+    await waitForSession(authReady);
+    if (authPhase !== "ready") throw new Error("Telegram session is not authorized. Reconnect this sender account.");
+    return td;
+  };
   return {
     async resumeSession() {
-      await Promise.race([firstAuth, new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error("Telegram session check timed out")), 15_000))]);
+      await waitForSession(firstAuth);
       if (authPhase !== "ready") return null;
-      await Promise.race([ready(), new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error("Telegram session check timed out")), 15_000))]);
+      await ready();
       return { userId, displayName, username };
     },
     async profile() {

@@ -71,17 +71,20 @@ export function workerPoolStatus(): Array<{ index: number; running: boolean; pen
 function call(accountId: string, method: Method, args: unknown[]): Promise<any> {
   if (!shards) throw new Error("sender workers are unavailable");
   const digest = createHash("sha256").update(accountId).digest();
-  const shard = shards[digest.readUInt32BE(0) % shards.length]!;
-  if (!shard.child?.connected) throw new Error("sender worker is unavailable");
+  const index = digest.readUInt32BE(0) % shards.length;
+  const shard = shards[index]!;
+  const child = shard.child;
+  if (!child?.connected) throw new Error("sender worker is unavailable");
   const id = ++sequence;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       shard.pending.delete(id);
+      console.error(`ads sender shard ${index} timed out on ${method} for account ${accountId}; restarting worker`);
       reject(new Error("sender worker timeout"));
-      if (method !== "close") shard.child?.kill("SIGKILL");
+      if (method !== "close" && shard.child === child) child.kill("SIGKILL");
     }, method === "close" ? 15_000 : 75_000);
     shard.pending.set(id, { resolve, reject, timer });
-    shard.child!.send({ id, accountId, method, args }, (error) => {
+    child.send({ id, accountId, method, args }, (error) => {
       if (!error) return;
       shard.pending.delete(id);
       clearTimeout(timer);

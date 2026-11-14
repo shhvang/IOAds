@@ -79,7 +79,7 @@ function retrySeconds(error: unknown, attempts: number): number | null {
   const message = String(error);
   const flood = /FLOOD_(?:PREMIUM_)?WAIT[_ ](\d+)|retry.after[^0-9]*(\d+)|wait(?: of)?\s+(\d+)/i.exec(message);
   if (flood) return Math.min(86_400, Number(flood[1] ?? flood[2] ?? flood[3]) + 1);
-  if (/timeout|network|connection|ECONN|EPIPE|socket|worker.*unavailable|worker.*exited|\b5\d\d\b|INTERNAL/i.test(message))
+  if (/timeout|network|\bconnection\b|\bECONN[A-Z_]*\b|\bEPIPE\b|socket|worker.*unavailable|worker.*exited|\b5\d\d\b|INTERNAL/i.test(message))
     return Math.min(3600, 5 * 2 ** Math.min(attempts - 1, 9)) + Math.floor(Math.random() * 5);
   return null;
 }
@@ -134,9 +134,13 @@ async function deliver(db: Database.Database, d: Delivery, getAdapter: (tenantId
     return true;
   } catch (error) {
     const delay = retrySeconds(error, d.attempts);
+    const unauthorizedSession = String(error).includes("Telegram session is not authorized. Reconnect this sender account.");
     db.transaction(() => {
       db.prepare("UPDATE deliveries SET status=?,nextAttemptAt=?,claimedAt=NULL,error=? WHERE id=? AND status='claimed'")
         .run(delay === null ? "failed" : "retry", delay === null ? null : new Date(Date.now() + delay * 1000).toISOString(), String(error).slice(0, 500), d.id);
+      if (unauthorizedSession)
+        db.prepare("UPDATE accounts SET status='logged_out',session=NULL,updatedAt=? WHERE tenantId=? AND accountId=? AND status='active'")
+          .run(now(), d.tenantId, d.accountId);
       if (String(error).includes("needs Premium to send custom emoji"))
         db.prepare("UPDATE campaignTargets SET enabled=0,updatedAt=? WHERE campaignId=? AND accountId=?").run(now(), d.campaignId, d.accountId);
       if (delay !== null && /FLOOD|retry.after|wait(?: of)?\s+\d+/i.test(String(error)))
