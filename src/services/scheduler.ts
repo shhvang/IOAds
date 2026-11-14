@@ -113,7 +113,15 @@ async function deliver(db: Database.Database, d: Delivery, getAdapter: (tenantId
       if (!config.botUsername) throw new Error("Inline delivery needs ADS_BOT_USERNAME.");
       await getAdapter(d.tenantId, d.accountId).sendInline(d.chatId, `campaign:${d.campaignId}`);
     }
-    else if (d.sourceChatId && d.sourceMessageId) await getAdapter(d.tenantId, d.accountId).copyMessage(d.chatId, d.sourceChatId, d.sourceMessageId, hasCustomEmoji);
+    else if (d.sourceChatId && d.sourceMessageId) {
+      const adapter = getAdapter(d.tenantId, d.accountId);
+      try {
+        await adapter.copyMessage(d.chatId, d.sourceChatId, d.sourceMessageId, hasCustomEmoji);
+      } catch (error) {
+        if (d.contentKind !== "text" || !/Chat to forward messages from not found/i.test(String(error))) throw error;
+        await adapter.sendMessage(d.chatId, message, entities);
+      }
+    }
     else if (d.contentKind === "text" || (d.contentKind === "legacy" && d.message !== "[Telegram media or rich message]")) await getAdapter(d.tenantId, d.accountId).sendMessage(d.chatId, message, entities);
     else throw new Error("Campaign content has no reusable inline result or archive copy");
     const time = now();

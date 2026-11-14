@@ -96,6 +96,17 @@ let copied: [string, string, number] | null = null;
 adapter.copyMessage = async (chatId, sourceChatId, messageId) => { copied = [chatId, sourceChatId, messageId]; };
 await runSchedulerOnce(db, () => adapter);
 assert.deepEqual(copied, ["-100123", "archive", 9]);
+const bold = { type: "bold", offset: 0, length: 6 };
+db.prepare("UPDATE campaigns SET message=?,messageEntities=?,contentKind='text',nextRunAt=? WHERE id=?")
+  .run("Format me", JSON.stringify([bold]), "2000-01-02T00:00:00.000Z", sourceCampaign.id);
+adapter.copyMessage = async () => { throw new Error("TDLibError: 400 Chat to forward messages from not found"); };
+let fallbackSent: { chatId: string; message: string; entities: Array<Record<string, unknown>> } | null = null;
+const originalSendMessage = adapter.sendMessage.bind(adapter);
+adapter.sendMessage = async (chatId, message, entities) => { fallbackSent = { chatId, message, entities: entities ?? [] }; await originalSendMessage(chatId, message, entities); };
+assert.equal(await runSchedulerOnce(db, () => adapter), 1);
+assert.deepEqual(fallbackSent, { chatId: "-100123", message: "Format me", entities: [bold] });
+assert.equal((db.prepare("SELECT status FROM deliveries ORDER BY id DESC LIMIT 1").get() as { status: string }).status, "sent");
+adapter.sendMessage = originalSendMessage;
 db.prepare("UPDATE accounts SET telegramUserId = ? WHERE tenantId = ? AND accountId = ?").run(987654, "tenant-a", accountId);
 assert.equal(inlineResults(db, 987654, `campaign:${sourceCampaign.id}`, config.botUsername).length, 1);
 assert.deepEqual(inlineResults(db, 123456, `campaign:${sourceCampaign.id}`, config.botUsername), []);
