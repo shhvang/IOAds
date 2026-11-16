@@ -62,16 +62,15 @@ export function registerAdminBot(bot: Bot, db: Database.Database, onUserBlocked?
     const connected = n(db, "SELECT COUNT(*) AS n FROM accounts WHERE status='active' AND session IS NOT NULL");
     const scheduled = n(db, "SELECT COUNT(*) AS n FROM campaigns WHERE status='scheduled'");
     const sent = n(db, "SELECT COUNT(*) AS n FROM deliveries WHERE status='sent' AND sentAt>=date('now')");
-    const failed = n(db, "SELECT COUNT(*) AS n FROM deliveries WHERE status IN ('failed','retry')");
     const workers = workerPoolStatus();
     const scheduler = schedulerProcessStatus();
     const ongoing = n(db, "SELECT COUNT(*) AS n FROM adminBroadcasts WHERE status IN ('running','paused')");
-    return render(ctx, `<h2>IOAds admin</h2><p>Service overview</p><table compact><tr><td>Bot users</td><td>${users}</td></tr><tr><td>Blocked users</td><td>${blockedUsers}</td></tr><tr><td>Tenants</td><td>${tenants}</td></tr><tr><td>Connected accounts</td><td>${connected}</td></tr><tr><td>Scheduled campaigns</td><td>${scheduled}</td></tr><tr><td>Campaign sends today</td><td>${sent}</td></tr><tr><td>Failed / retrying</td><td>${failed}</td></tr><tr><td>Scheduler</td><td>${scheduler.running ? "Running" : "Down"}</td></tr><tr><td>Sender workers</td><td>${workers.filter((w) => w.running).length} / ${workers.length}</td></tr><tr><td>Active broadcasts</td><td>${ongoing}</td></tr></table><p>Rental feed: ${e(date(lastFeedSyncAt()))}</p>`, [
+    return render(ctx, `<h2>IOAds admin</h2><p>Service overview</p><table compact><tr><td>Bot users</td><td>${users}</td></tr><tr><td>Blocked users</td><td>${blockedUsers}</td></tr><tr><td>Tenants</td><td>${tenants}</td></tr><tr><td>Connected accounts</td><td>${connected}</td></tr><tr><td>Scheduled campaigns</td><td>${scheduled}</td></tr><tr><td>Campaign sends today</td><td>${sent}</td></tr><tr><td>Scheduler</td><td>${scheduler.running ? "Running" : "Down"}</td></tr><tr><td>Sender workers</td><td>${workers.filter((w) => w.running).length} / ${workers.length}</td></tr><tr><td>Active broadcasts</td><td>${ongoing}</td></tr></table><p>Rental feed: ${e(date(lastFeedSyncAt()))}</p>`, [
       [button("Users & premium", "a:users:0", "primary", "people"), button("Tenants", "a:tenants:0", undefined, "people")],
       [button("Accounts", "a:accounts:0"), button("Campaigns", "a:campaigns:0")],
       [button("All groups", "a:directory:0", "primary"), button("Export group links", "a:exportgroups")],
-      [button("Delivery failures", "a:failures:0", undefined, "warning"), button("Broadcasts", "a:broadcasts:0", undefined, "megaphone")],
-      [button("Audit", "a:audit:0"), button("Refresh", "a:home", "link", "refresh")],
+      [button("Broadcasts", "a:broadcasts:0", undefined, "megaphone"), button("Audit", "a:audit:0")],
+      [button("Refresh", "a:home", "link", "refresh")],
       [back("home", "Public home")],
     ]);
   }
